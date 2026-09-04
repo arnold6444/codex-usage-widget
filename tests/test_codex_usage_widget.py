@@ -40,7 +40,7 @@ def window(used, minutes, reset=1_800_000_000):
 
 
 class SelectionTests(unittest.TestCase):
-    def test_uses_default_weekly_and_named_53_five_hour(self):
+    def test_ignores_53_meter_and_uses_default_weekly(self):
         result = {
             "rateLimits": {
                 "limitId": "codex",
@@ -65,10 +65,9 @@ class SelectionTests(unittest.TestCase):
         snapshot = select_usage_windows(result)
 
         self.assertEqual(snapshot.limit_id, "codex")
-        self.assertEqual(snapshot.five_hour.remaining_percent, 100)
+        self.assertIsNone(snapshot.five_hour)
         self.assertEqual(snapshot.weekly.remaining_percent, 73)
-        self.assertEqual(snapshot.five_hour_label, "5.3 5h")
-        self.assertEqual(snapshot.five_hour_limit_id, "codex_bengalfox")
+        self.assertIsNone(snapshot.five_hour_limit_id)
         self.assertEqual(snapshot.weekly_limit_id, "codex")
 
     def test_duration_not_primary_secondary_name_controls_selection(self):
@@ -84,7 +83,7 @@ class SelectionTests(unittest.TestCase):
 
         snapshot = select_usage_windows(result)
 
-        self.assertEqual(snapshot.five_hour.used_percent, 25)
+        self.assertIsNone(snapshot.five_hour)
         self.assertEqual(snapshot.weekly.used_percent, 60)
 
     def test_specialized_weekly_never_replaces_default_weekly(self):
@@ -106,7 +105,7 @@ class SelectionTests(unittest.TestCase):
         snapshot = select_usage_windows(result)
 
         self.assertEqual(snapshot.limit_id, "codex")
-        self.assertEqual(snapshot.five_hour.used_percent, 10)
+        self.assertIsNone(snapshot.five_hour)
         self.assertEqual(snapshot.weekly.used_percent, 27)
 
     def test_falls_back_to_coherent_legacy_pair(self):
@@ -120,9 +119,10 @@ class SelectionTests(unittest.TestCase):
 
         snapshot = select_usage_windows(result)
 
-        self.assertTrue(snapshot.complete)
-        self.assertEqual(snapshot.five_hour.remaining_percent, 87.5)
+        self.assertFalse(snapshot.complete)
+        self.assertIsNone(snapshot.five_hour)
         self.assertEqual(snapshot.weekly.remaining_percent, 56)
+        self.assertTrue(snapshot.available)
 
     def test_unnamed_specialized_five_hour_is_not_guessed(self):
         result = {
@@ -203,6 +203,12 @@ class SelectionTests(unittest.TestCase):
             "R 20:30",
         )
 
+        later = datetime(2027, 1, 22, 20, 30, tzinfo=local_tz).timestamp()
+        self.assertEqual(
+            format_compact_reset_time(later, now=now, local_tz=local_tz),
+            "R 1/22(금) 20:30",
+        )
+
 
 FAKE_SERVER = r"""
 import json
@@ -254,7 +260,7 @@ class ClientTests(unittest.TestCase):
         try:
             result = client.read_rate_limits()
             snapshot = select_usage_windows(result)
-            self.assertEqual(snapshot.five_hour.remaining_percent, 73)
+            self.assertIsNone(snapshot.five_hour)
             self.assertEqual(snapshot.weekly.remaining_percent, 41)
         finally:
             client.shutdown()
@@ -348,7 +354,8 @@ class PollerTests(unittest.TestCase):
             second = messages.get(timeout=2)
             self.assertEqual(first.kind, "reconnecting")
             self.assertEqual(second.kind, "snapshot")
-            self.assertEqual(second.snapshot.five_hour.remaining_percent, 73)
+            self.assertIsNone(second.snapshot.five_hour)
+            self.assertEqual(second.snapshot.weekly.remaining_percent, 41)
         finally:
             poller.stop()
             poller.join(timeout=2)
@@ -383,7 +390,8 @@ class PollerTests(unittest.TestCase):
                     break
 
             self.assertIsNotNone(recovered)
-            self.assertTrue(recovered.snapshot.complete)
+            self.assertTrue(recovered.snapshot.available)
+            self.assertIsNotNone(recovered.snapshot.weekly)
             self.assertIsNot(first_connection, client._connection)
         finally:
             poller.stop()
@@ -511,29 +519,19 @@ class WidgetSmokeTests(unittest.TestCase):
             persist_state=False,
         )
         snapshot = UsageSnapshot(
-            five_hour=RateWindow(0, 300, 1_800_000_000),
+            five_hour=None,
             weekly=RateWindow(27, 10_080, 1_800_100_000),
             limit_id="codex",
-            five_hour_label="5.3 5h",
-            five_hour_limit_id="codex_bengalfox",
             weekly_limit_id="codex",
         )
         try:
             widget._apply_message(UiMessage("snapshot", snapshot=snapshot))
             root.update_idletasks()
 
-            self.assertEqual(
-                widget.compact_five_hour.label.cget("text"),
-                "5.3 5h 100%",
-            )
             self.assertEqual(widget.compact_weekly.label.cget("text"), "Week 73%")
             self.assertEqual(widget.status_label.cget("text"), "LIVE")
-            self.assertEqual(widget.five_hour_row.label.cget("text"), "5.3 5h left")
-            self.assertEqual(widget.five_hour_row.percent.cget("text"), "100%")
             self.assertEqual(widget.weekly_row.percent.cget("text"), "73%")
-            self.assertTrue(widget.compact_five_hour.reset.cget("text").startswith("R "))
             self.assertTrue(widget.compact_weekly.reset.cget("text").startswith("R "))
-            self.assertEqual(widget.compact_five_hour.reset.cget("fg"), COMPACT_RESET_TEXT)
             self.assertEqual(widget.compact_weekly.reset.cget("fg"), COMPACT_RESET_TEXT)
         finally:
             widget.close()

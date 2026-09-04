@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\install_startup.ps1 -Remove
 python codex_usage_widget.py
 ```
 
-- 기본 compact HUD는 왼쪽 날씨 위젯과 가운데 시작 버튼 사이에 `5.3 5h … | Week …`와 각각의 작은 `R` reset 시간으로 표시됩니다. compact에서는 공간 확보를 위해 progress bar를 숨깁니다.
+- 기본 compact HUD는 왼쪽 날씨 위젯 오른쪽 4px 지점에 붙어 `Week …`와 `R 9/11(금) 15:17` 형태의 reset 날짜·요일·시간을 표시합니다. 폭은 114px이며 compact에서는 progress bar를 숨깁니다.
 - `▴`를 누르면 progress bar와 reset 시간이 있는 280x130 상세 HUD가 작업 표시줄 바로 위에 열리고, `▾`로 다시 접습니다.
 - 버튼 이외의 영역을 드래그해 이동할 수 있습니다.
 - 드래그한 위치와 compact/상세 상태는 종료 전에 자동 저장되며, 다음 실행 때 그대로 복원됩니다.
@@ -93,12 +93,13 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 ## 표시 기준
 
-- `5.3 5h`: `limitName`이 GPT-5.3임을 명시한 항목의 `windowDurationMins == 300`
 - `Week`: 기본 `rateLimits` 또는 `limitId == codex` 항목의 `windowDurationMins == 10080`
 - 남은 값: `100 - usedPercent`
 - Reset: `resetsAt` Unix 초를 Windows 로컬 시간으로 변환한 값
 
-기본 Codex는 현재 주간 한도만 제공할 수 있고, 5시간 한도는 `GPT-5.3-Codex-Spark` 같은 모델 전용 항목에만 있을 수 있습니다. 따라서 모델 전용 항목의 주간 수치를 전체 Codex 주간 수치로 사용하지 않습니다. 기본 `codex` 주간 값과 이름이 명확한 GPT-5.3의 300분 값을 각각 독립적으로 표시하며, 출처가 모호한 항목은 `—`로 둡니다.
+초미니 화면도 reset 날짜·요일·시간을 모두 표시하며, 펼친 상세 화면은 같은 시각을 더 크게 표시합니다.
+
+기본 Codex의 현재 주간 값만 표시합니다. `GPT-5.3-Codex-Spark` 같은 모델 전용 300분/주간 항목은 모두 무시하므로 전체 Codex 주간 수치와 혼동되지 않습니다. 기본 주간 출처를 확인할 수 없으면 `—`로 둡니다.
 
 이 프로그램은 `auth.json`, access token, 다른 인증 파일을 직접 읽지 않습니다. 인증과 네트워크 요청은 설치된 Codex CLI의 `app-server`가 담당합니다. 프로토콜 설명은 [OpenAI 공식 Codex App Server 문서](https://developers.openai.com/codex/app-server)를 참고하세요.
 

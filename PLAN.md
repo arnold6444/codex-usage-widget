@@ -61,9 +61,27 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Allow a valid weekly-only snapshot; never require a 300/10080 pair and never substitute the GPT-5.3-specific weekly value for the default weekly value.
 - Done when the current live response renders the GPT-5.3 300-minute remaining value alongside the default Codex 10080-minute remaining value and their source IDs are verified separately.
 
+## Requirement Delta (2026-09-04, week-only final display)
+
+- Supersede the prior GPT-5.3 display decision: show no 300-minute or model-specific meter anywhere in compact or detail mode.
+- Show only the default `codex` 10080-minute weekly meter, its remaining percentage, progress bar in detail mode, and reset time.
+- Reduce compact width from 226px to 114px while retaining status, expand, close, drag, persistence, refresh, and z-order recovery.
+- Done when the live EXE visibly contains only `Week`, its value matches the current default `codex` response, the compact window measures 114x32, and the private GitHub repository/release are updated.
+
+## Requirement Delta (2026-09-04, weather adjacency and weekday)
+
+- Place the default 114px compact HUD four pixels to the right of the current Windows Widgets/weather button; invalidate the older saved-layout version so the corrected default is applied once.
+- Render non-today compact weekly resets as `R M/D(요일)` while preserving the exact local reset time in detail mode.
+- Done when the live compact EXE starts at the current weather button's right edge plus four pixels and shows the correct Korean weekday for the API reset date.
+
+## Requirement Delta (2026-09-04, compact reset clock)
+
+- Keep the 114x32 compact size but extend its lower reset row beneath the top-only controls.
+- Render the full compact reset as `R M/D(요일) HH:MM`; detail mode continues to show the full local timestamp.
+
 ## Key Decisions
 
-- Prefer the backward-compatible `rateLimits` view for the default Codex weekly value, falling back only to an unambiguous `limitId=codex` entry. Select a separate 300-minute value only from an explicitly named GPT-5.3 entry and label it accordingly; ignore that model entry's weekly window for the default Week display.
+- Prefer the backward-compatible `rateLimits` view for the default Codex weekly value, falling back only to an unambiguous `limitId=codex` entry. Ignore every model-specific and 300-minute meter.
 - Match JSON-RPC responses by `id` because notifications can appear between responses. Omit the `jsonrpc` header as specified by the Codex wire protocol.
 - Run all subprocess I/O in a daemon worker and pass snapshots to tkinter through a thread-safe queue polled with `after`.
 - On transport/process errors, close the owned process, show a compact reconnecting status, and retry on a short delay; successful reads return to the 30-second cadence.
@@ -89,7 +107,7 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 
 - `python codex_usage_widget.py` opens the requested Windows HUD using no non-standard packages.
 - Live values come only from `account/rateLimits/read` after a valid initialize handshake.
-- The explicitly named GPT-5.3 300-minute window and default Codex 10080-minute window independently drive their labels, percentages, bars, and reset times; a model-specific weekly value never replaces the default weekly value.
+- Only the default Codex 10080-minute window drives the label, percentage, detail progress bar, and reset time; every model-specific or 300-minute meter is ignored.
 - The UI remains responsive, refreshes every 30 seconds, and recovers after its app-server process exits.
 - Closing the HUD shuts down its worker and owned app-server process.
 - README Windows instructions are accurate, and targeted tests plus live/local smoke checks pass.
@@ -112,7 +130,8 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - [x] Close/reopen state restoration verified with the packaged EXE.
 - [x] Compact bars replaced with brighter reset-time labels and screenshot-verified.
 - [x] Explorer taskbar z-order recovery implemented and live regression-tested.
-- [x] Default-weekly/GPT-5.3-five-hour source selection corrected and verified against the current live response.
+- [x] Default weekly-only source selection implemented; all model-specific 5-hour groups are ignored.
+- [x] Final week-only 114px compact layout, weather adjacency, and Korean reset weekday implemented and live-verified.
 
 ## Verification
 
@@ -121,17 +140,16 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Confirmed: live initialize and `account/rateLimits/read` requests succeeded without direct credential access.
 - Passed: `python -W error::ResourceWarning -m unittest discover -v` -> 23 tests, including notification interleaving, meter-source selection, weekly-only snapshots, reconnect, active shutdown, taskbar placement, compact/detail toggling, state persistence, off-screen/L-shaped monitor fallback, single-instance locking, and Windows HUD attributes.
 - Passed: `python -m compileall -q .`.
-- Passed: current live response probe -> `codex_bengalfox` / `GPT-5.3-Codex-Spark` 300-minute remaining `100%`, default `codex` 10080-minute remaining `70%`; final EXE rendered exactly `5.3 5h 100% | Week 70%` and ignored the model-specific weekly value.
+- Passed: final live response probe -> default `codex` 10080-minute remaining `61%`, `five_hour=None`; the packaged EXE uses the same 30-second polling path.
 - Passed: live child app-server termination -> a new wrapper PID, fresh handshake, and complete snapshot; no extra app-server remained after shutdown.
-- Passed: tkinter live smoke -> `LIVE`, `280x130`, topmost true, both percentages and reset labels populated.
+- Passed: tkinter live smoke -> `LIVE`, topmost true, weekly percentage/reset populated, and no five-hour widgets present.
 - Passed: exact `python codex_usage_widget.py` launch -> widget stayed running with exactly one owned app-server child; the test process tree was removed afterward with no leftover app-server.
-- Passed: live compact screenshot -> 226x32 HUD at `x=166, y=1040` inside the 48px taskbar gap; Widgets ended at `x=158` and task buttons began at `x=473`, with no overlap.
-- Passed: live `▴` click and detail screenshot -> 280x130 HUD at `x=166, y=894`, eight pixels above the taskbar, with both progress bars and reset times visible.
+- Passed: final live compact screenshot -> 114x32 HUD at `x=162, y=1040`; Windows UI Automation measured the Widgets/weather button ending at `x=158`, producing the requested four-pixel gap.
 - Passed: PyInstaller 6.21.0 `--onefile --windowed` build -> `dist\CodexUsageWidget.exe`; direct EXE launch reached live usage through the installed `codex.CMD` app-server chain.
 - Passed: current-user `Codex Usage Widget.lnk` created in the Startup folder; COM inspection confirmed the absolute target and working directory, and launching the shortcut opened the live EXE.
 - Passed: packaged close/reopen round trip restored compact mode and exact `x=166, y=1040`; old CMD/Node/Codex app-server child processes all exited before the new instance started.
 - Passed: launching the EXE again while it was open left the same two PyInstaller process IDs, confirming duplicate suppression.
-- Passed: final compact screenshot shows no progress lines and displays brighter 7-point reset labels (`R HH:MM` / `R MM/DD HH:MM`) under both usage percentages.
+- Passed: final compact screenshot shows no progress line and displays the bright weekly reset label as `R 9/11(금) 15:17`, including the local reset weekday and clock time.
 - Passed: reproduced the real failure with a live process reported visible at `166,1040` but fully covered by `Shell_TrayWnd`; `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` restored it immediately.
-- Passed: final EXE periodically reasserted its z-order after the taskbar was deliberately raised, remained visible, and left the foreground window unchanged.
+- Passed: final EXE resolves its actual top-level `Codex Usage` HWND every 500ms; after the taskbar was deliberately raised it remained visible and left the foreground window unchanged.
 - Not run: a disruptive Windows reboot/sign-out; the actual Startup shortcut execution path was tested directly instead.

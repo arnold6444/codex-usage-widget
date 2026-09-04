@@ -28,11 +28,11 @@ ONE_WEEK_MINS = 10_080
 REFRESH_SECONDS = 30.0
 RPC_TIMEOUT_SECONDS = 20.0
 RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 30.0)
-TOPMOST_REFRESH_MS = 1_000
+TOPMOST_REFRESH_MS = 500
 
 WINDOW_WIDTH = 280
 WINDOW_HEIGHT = 130
-COMPACT_WIDTH = 226
+COMPACT_WIDTH = 114
 COMPACT_HEIGHT = 32
 
 BG = "#17191f"
@@ -120,7 +120,7 @@ def default_settings_path() -> Path:
 class WindowStateStore:
     """Tolerant, atomic storage for non-sensitive HUD layout state."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = path or default_settings_path()
@@ -313,12 +313,11 @@ def _parse_group(raw: Any, fallback_id: Optional[str] = None) -> Optional[_RateG
 
 
 def select_usage_windows(result: Mapping[str, Any]) -> UsageSnapshot:
-    """Select the default Codex weekly meter and a clearly named 5.3 meter.
+    """Select only the default Codex weekly meter.
 
     The backward-compatible ``rateLimits`` view is the authoritative default
-    Codex meter. Model-specific entries in ``rateLimitsByLimitId`` must never
-    replace its weekly value. A specialized 300-minute window is shown only
-    when the server explicitly names it as GPT-5.3.
+    Codex meter. Model-specific entries in ``rateLimitsByLimitId`` never
+    replace its weekly value, and 300-minute model meters are not displayed.
     """
 
     legacy = _parse_group(result.get("rateLimits"))
@@ -344,31 +343,14 @@ def select_usage_windows(result: Mapping[str, Any]) -> UsageSnapshot:
             canonical = codex_weekly[0]
 
     weekly = canonical.windows.get(ONE_WEEK_MINS) if canonical is not None else None
-    five_hour = canonical.windows.get(FIVE_HOURS_MINS) if canonical is not None else None
-    five_hour_label = "5h"
-    five_hour_limit_id = canonical.limit_id if five_hour is not None else None
-
-    named_five_three = [
-        group
-        for group in groups
-        if FIVE_HOURS_MINS in group.windows
-        and group.limit_id != (canonical.limit_id if canonical is not None else None)
-        and group.limit_name is not None
-        and "5.3" in group.limit_name
-    ]
-    if five_hour is None and len(named_five_three) == 1:
-        selected = named_five_three[0]
-        five_hour = selected.windows[FIVE_HOURS_MINS]
-        five_hour_label = "5.3 5h"
-        five_hour_limit_id = selected.limit_id
 
     return UsageSnapshot(
-        five_hour=five_hour,
+        five_hour=None,
         weekly=weekly,
         limit_id=canonical.limit_id if canonical is not None else None,
-        five_hour_label=five_hour_label,
+        five_hour_label="5h",
         weekly_label="Week",
-        five_hour_limit_id=five_hour_limit_id,
+        five_hour_limit_id=None,
         weekly_limit_id=canonical.limit_id if weekly is not None else None,
     )
 
@@ -418,10 +400,33 @@ def format_compact_reset_time(
     now: Optional[datetime] = None,
     local_tz: Any = None,
 ) -> str:
-    rendered = format_reset_time(resets_at, now=now, local_tz=local_tz)
-    if rendered == "Reset —":
+    if resets_at is None:
         return "R —"
-    return f"R {rendered.removeprefix('Reset ')}"
+
+    if local_tz is None:
+        local_tz = datetime.now().astimezone().tzinfo
+    if now is None:
+        now = datetime.now(local_tz)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=local_tz)
+    else:
+        now = now.astimezone(local_tz)
+
+    try:
+        reset = datetime.fromtimestamp(resets_at, tz=timezone.utc).astimezone(local_tz)
+    except (OSError, OverflowError, ValueError):
+        return "R —"
+
+    if reset.date() == now.date():
+        return f"R {reset.strftime('%H:%M')}"
+
+    weekday = "월화수목금토일"[reset.weekday()]
+    if reset.year == now.year:
+        return f"R {reset.month}/{reset.day}({weekday}) {reset.strftime('%H:%M')}"
+    return (
+        f"R {str(reset.year)[2:]}/{reset.month}/{reset.day}({weekday}) "
+        f"{reset.strftime('%H:%M')}"
+    )
 
 
 def resolve_codex_command() -> tuple[str, ...]:
@@ -801,7 +806,7 @@ class UsagePoller(threading.Thread):
                         self.output.put(
                             UiMessage(
                                 "unavailable",
-                                detail="기본 주간 또는 이름이 확인된 5.3 한도를 찾지 못했습니다.",
+                                detail="기본 Codex 주간 한도를 찾지 못했습니다.",
                             )
                         )
                     failure_count = 0
@@ -885,7 +890,15 @@ class UsageRow:
 
 
 class CompactUsage:
-    def __init__(self, parent: tk.Widget, x: int, width: int, label: str) -> None:
+    def __init__(
+        self,
+        parent: tk.Widget,
+        x: int,
+        width: int,
+        label: str,
+        *,
+        reset_width: Optional[int] = None,
+    ) -> None:
         self.prefix = label
         self.width = width
         self.label = tk.Label(
@@ -906,7 +919,7 @@ class CompactUsage:
             font=("Segoe UI Semibold", 7),
             anchor="w",
         )
-        self.reset.place(x=x, y=17, width=width, height=12)
+        self.reset.place(x=x, y=17, width=reset_width or width, height=12)
 
     def set_prefix(self, prefix: str) -> None:
         self.prefix = prefix
@@ -1033,7 +1046,7 @@ def _compact_initial_position(root: tk.Tk) -> tuple[int, int]:
     layout = _taskbar_layout()
     if layout is not None and layout.horizontal:
         scale = max(0.75, layout.dpi / 96.0)
-        x = layout.left + round(166 * scale)
+        x = layout.left + round(162 * scale)
         if layout.task_buttons_left is not None:
             x = min(x, layout.task_buttons_left - COMPACT_WIDTH - round(12 * scale))
         x = max(layout.left + 6, min(x, layout.right - COMPACT_WIDTH - 6))
@@ -1158,8 +1171,14 @@ def _raise_window_above_taskbar(root: tk.Tk) -> bool:
         ]
         set_window_pos.restype = ctypes.c_bool
 
+        find_window = user32.FindWindowW
+        find_window.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        find_window.restype = ctypes.c_void_p
+
         inner_handle = ctypes.c_void_p(root.winfo_id())
-        top_handle = get_ancestor(inner_handle, 2) or inner_handle.value  # GA_ROOT
+        top_handle = find_window(None, root.title())
+        if not top_handle:
+            top_handle = get_ancestor(inner_handle, 2) or inner_handle.value  # GA_ROOT
         flags = 0x0001 | 0x0002 | 0x0010 | 0x0040
         return bool(
             set_window_pos(
@@ -1273,8 +1292,7 @@ class CodexUsageWidget:
         )
         self.close_button.place(x=244, y=2, width=28, height=24)
 
-        self.five_hour_row = UsageRow(self.detail_panel, 30, "5h left")
-        self.weekly_row = UsageRow(self.detail_panel, 78, "Week left")
+        self.weekly_row = UsageRow(self.detail_panel, 54, "Week left")
 
         self.compact_panel = tk.Frame(
             root,
@@ -1290,18 +1308,14 @@ class CodexUsageWidget:
             font=("Segoe UI", 7),
             anchor="center",
         )
-        self.compact_status.place(x=4, y=8, width=11, height=13)
-        self.compact_five_hour = CompactUsage(self.compact_panel, 17, 81, "5h")
-        self.compact_separator = tk.Label(
+        self.compact_status.place(x=3, y=3, width=9, height=13)
+        self.compact_weekly = CompactUsage(
             self.compact_panel,
-            text="|",
-            bg=BG,
-            fg="#606570",
-            font=("Segoe UI", 9),
-            anchor="center",
+            13,
+            60,
+            "Week",
+            reset_width=99,
         )
-        self.compact_separator.place(x=99, y=2, width=7, height=21)
-        self.compact_weekly = CompactUsage(self.compact_panel, 107, 67, "Week")
         self.compact_toggle_button = tk.Button(
             self.compact_panel,
             text="▴",
@@ -1312,11 +1326,11 @@ class CodexUsageWidget:
             activeforeground=TEXT,
             bd=0,
             highlightthickness=0,
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 8),
             cursor="hand2",
             takefocus=False,
         )
-        self.compact_toggle_button.place(x=176, y=4, width=23, height=24)
+        self.compact_toggle_button.place(x=74, y=0, width=18, height=17)
         self.compact_close_button = tk.Button(
             self.compact_panel,
             text="×",
@@ -1327,11 +1341,11 @@ class CodexUsageWidget:
             activeforeground=TEXT,
             bd=0,
             highlightthickness=0,
-            font=("Segoe UI", 11),
+            font=("Segoe UI", 9),
             cursor="hand2",
             takefocus=False,
         )
-        self.compact_close_button.place(x=201, y=3, width=23, height=25)
+        self.compact_close_button.place(x=94, y=0, width=18, height=17)
 
         self._compact_mode = self._window_state.compact_mode
         self._bind_drag_widgets(self.detail_panel)
@@ -1515,21 +1529,15 @@ class CodexUsageWidget:
 
     def _apply_message(self, message: UiMessage) -> None:
         if message.kind == "snapshot" and message.snapshot is not None:
-            self.five_hour_row.set_title(f"{message.snapshot.five_hour_label} left")
             self.weekly_row.set_title(f"{message.snapshot.weekly_label} left")
-            self.compact_five_hour.set_prefix(message.snapshot.five_hour_label)
             self.compact_weekly.set_prefix(message.snapshot.weekly_label)
-            self.five_hour_row.set_window(message.snapshot.five_hour)
             self.weekly_row.set_window(message.snapshot.weekly)
             self.status_label.configure(text="LIVE", fg=GREEN)
-            self.compact_five_hour.set_window(message.snapshot.five_hour)
             self.compact_weekly.set_window(message.snapshot.weekly)
             self.compact_status.configure(fg=GREEN)
             return
 
-        self.five_hour_row.set_window(None)
         self.weekly_row.set_window(None)
-        self.compact_five_hour.set_window(None)
         self.compact_weekly.set_window(None)
         if message.kind == "reconnecting":
             self.status_label.configure(text="RECONNECTING", fg=AMBER)
