@@ -135,6 +135,11 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 
 ## Verification
 
+- 2026-09-05 persistence fix: the HUD process was absent; the previous Startup shortcut only launched at login and could not recover an exited process. Replaced it with the per-user interactive `Codex Usage Widget` scheduled task (login + one-minute recurrence, no time limit, battery allowed).
+- Scheduler launch verified from the repository EXE path: parent `svchost.exe` PID 3160, visible HUD at `(162,1040)` with size `114x32`. The attempted LocalAppData copy was not visible to the scheduler, so it is not used by the final task.
+- Forced termination of the scheduled HUD and its complete app-server process tree at 14:21:35 recovered automatically at 14:21:50 with new HUD PIDs 27852/24148; window visible at the same coordinates. Codex desktop restart/update itself and Windows reboot were not performed.
+- Normal WM_CLOSE at 14:22:37 exited cleanly (task result 0); recurrence at 14:22:51 restarted the HUD as PIDs 24224/30248, visible at `(162,1040,276,1072)`. No manual launch was used for either recovery test.
+
 - Confirmed: `codex --version` -> `codex-cli 0.128.0`.
 - Confirmed: `codex app-server --help` exits 0 and lists stdio as the default transport.
 - Confirmed: live initialize and `account/rateLimits/read` requests succeeded without direct credential access.

@@ -36,19 +36,19 @@ codex app-server --help
 
 ## Windows 자동 실행
 
-현재 사용자 시작프로그램 바로가기:
+현재 사용자 Windows 작업 스케줄러의 `Codex Usage Widget` 작업으로 실행합니다.
 
 ```text
-C:\Users\arnol\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Codex Usage Widget.lnk
+C:\Users\arnol\Documents\ChatGPT\ai-usage-bot\dist\CodexUsageWidget.exe
 ```
 
-로그인할 때마다 EXE가 자동 실행됩니다. 다시 등록하려면 프로젝트 폴더에서 다음을 실행합니다.
+로그인 시 실행하고, 종료되면 1분 간격으로 다시 실행합니다. Windows가 직접 실행하므로 Codex 앱 종료와 독립적입니다. 배터리에서도 계속 실행하고 실행 시간 제한은 없습니다. 기존 로그인 전용 바로가기는 등록 후 제거합니다. 다시 등록하려면 프로젝트 폴더에서 다음을 실행합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_startup.ps1
 ```
 
-자동 실행만 해제하려면:
+계속 켜짐 모드에서는 `×`로 닫아도 다음 주기에 다시 열립니다. 완전히 종료하려면 먼저 아래 명령으로 자동 복구를 해제한 뒤 위젯을 닫으세요. EXE를 재빌드할 때도 먼저 해제하고 닫은 다음 빌드 후 재등록하세요.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_startup.ps1 -Remove
