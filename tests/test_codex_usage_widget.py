@@ -727,13 +727,27 @@ class AlertTrackerTests(unittest.TestCase):
         self.assertEqual(critical.level_name, "CRITICAL")
         self.assertIsNone(tracker.evaluate("codex:weekly", "CX 주", 99, reset))
 
+    def test_a_wobbling_reset_time_is_the_same_window(self):
+        """Codex moves ``resetsAt`` by a second between polls.
+
+        Treating that as a new quota window re-announced the same limit every
+        30 seconds, which is exactly what it did in the field.
+        """
+
+        tracker = AlertTracker()
+        self.assertIsNotNone(
+            tracker.evaluate("codex:weekly", "CX 주", 96, 1_789_810_463.0)
+        )
+        for drift in (1_789_810_462.0, 1_789_810_464.0, 1_789_810_461.0):
+            self.assertIsNone(tracker.evaluate("codex:weekly", "CX 주", 96, drift))
+
     def test_a_new_reset_time_re_arms_the_thresholds(self):
         tracker = AlertTracker()
         self.assertIsNotNone(tracker.evaluate("cl:5h", "CL 5h", 95, 100.0))
         self.assertIsNone(tracker.evaluate("cl:5h", "CL 5h", 95, 100.0))
 
         # Window rolled over: the same usage is news again.
-        event = tracker.evaluate("cl:5h", "CL 5h", 95, 200.0)
+        event = tracker.evaluate("cl:5h", "CL 5h", 95, 100.0 + 5 * 3600)
         self.assertIsNotNone(event)
         self.assertEqual(event.level_name, "CRITICAL")
 
@@ -814,6 +828,7 @@ class AlertIntegrationTests(unittest.TestCase):
             autostart=False,
             persist_state=False,
             notifier=notifier,
+            alerts_enabled=True,
         )
         hot = select_usage_windows(
             {"rateLimits": {"limitId": "codex", "primary": window(93, 10_080)}}
@@ -849,6 +864,7 @@ class AlertIntegrationTests(unittest.TestCase):
             autostart=False,
             persist_state=False,
             notifier=_RecordingNotifier(),
+            alerts_enabled=True,
         )
         try:
             widget._flash_border(RED, remaining=1)
@@ -885,6 +901,7 @@ class AlertIntegrationTests(unittest.TestCase):
                 snapshot_store=store,
                 persist_snapshot=True,
                 notifier=notifier,
+                alerts_enabled=True,
             )
             try:
                 widget._apply_message(UiMessage("snapshot", snapshot=hot))
@@ -905,6 +922,34 @@ class AlertIntegrationTests(unittest.TestCase):
             finally:
                 widget.close()
                 widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
+    def test_alerts_are_off_unless_asked_for(self):
+        notifier = _RecordingNotifier()
+        root = tk.Tk()
+        root.withdraw()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+            notifier=notifier,
+        )
+        try:
+            self.assertFalse(widget.alerts_enabled)
+            widget._apply_message(
+                UiMessage(
+                    "snapshot",
+                    snapshot=select_usage_windows(
+                        {"rateLimits": {"limitId": "codex", "primary": window(97, 10_080)}}
+                    ),
+                )
+            )
+            self.assertEqual(notifier.calls, [])
+        finally:
+            widget.close()
+            widget.shutdown()
 
     @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
     def test_alerts_can_be_switched_off(self):
