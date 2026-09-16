@@ -1,13 +1,15 @@
-"""Small always-on-top Windows HUD for Codex usage limits.
+"""Small always-on-top Windows HUD for Codex and Claude usage limits.
 
-The widget talks only to the official ``codex app-server`` subprocess.  It does
-not open Codex credential files or handle access tokens itself.
+The widget talks only to the official ``codex app-server`` and ``claude``
+subprocesses.  It does not open credential files or handle access tokens itself.
 """
 
 from __future__ import annotations
 
 import ctypes
 import json
+import logging
+import logging.handlers
 import math
 import os
 import queue
@@ -20,7 +22,22 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from claude_usage_client import (
+    CLAUDE_REFRESH_SECONDS,
+    ClaudeConnectionError,
+    ClaudeUnavailableError,
+    ClaudeUsageClient,
+    ClaudeUsageError,
+    parse_limit_window,
+)
+from usage_alerts import (
+    AlertEvent,
+    AlertTracker,
+    TrayNotifier,
+    describe_alert,
+)
 
 
 FIVE_HOURS_MINS = 300
@@ -29,11 +46,30 @@ REFRESH_SECONDS = 30.0
 RPC_TIMEOUT_SECONDS = 20.0
 RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 30.0)
 TOPMOST_REFRESH_MS = 500
+DISPLAY_WATCH_MS = 30_000
+
+SOURCE_CODEX = "codex"
+SOURCE_CLAUDE = "claude"
+SOURCES = (SOURCE_CODEX, SOURCE_CLAUDE)
+
+LOG_MAX_BYTES = 256 * 1024
+LOG_BACKUP_COUNT = 2
+RAISE_LOG_INTERVAL_SECONDS = 60.0
+ALERT_FLASH_STEPS = 6
+ALERT_FLASH_MS = 220
+ALERT_NOTIFY_LINGER_MS = 12_000
 
 WINDOW_WIDTH = 280
-WINDOW_HEIGHT = 130
-COMPACT_WIDTH = 114
+WINDOW_HEIGHT = 186
+# Sized to the free taskbar strip between the weather widget and the centred
+# task buttons: wider than this and the HUD has to overlap one of them.
+COMPACT_WIDTH = 308
 COMPACT_HEIGHT = 32
+COMPACT_COLUMN_XS = (13, 97, 181)
+COMPACT_COLUMN_WIDTH = 80
+COMPACT_RESET_WIDTH = 84
+DETAIL_ROW_YS = (44, 90, 136)
+DETAIL_BAR_WIDTH = 258
 
 BG = "#17191f"
 BAR_BG = "#30333b"
@@ -44,6 +80,129 @@ GREEN = "#54d38a"
 AMBER = "#f0b45a"
 RED = "#ef6a73"
 BORDER = "#353944"
+
+
+_UI_SCALE = 1.0
+
+LOG = logging.getLogger("codex_usage_widget")
+LOG.addHandler(logging.NullHandler())
+
+
+def default_log_path() -> Path:
+    return default_settings_path().with_name("widget.log")
+
+
+def setup_logging(
+    path: Optional[Path] = None,
+    *,
+    level: int = logging.INFO,
+) -> Optional[Path]:
+    """Attach a rotating file log; never let logging break the HUD.
+
+    Every Win32 failure in here used to be swallowed silently, which is why a
+    z-order bug could only be found by reproducing it by hand.
+    """
+
+    target = path or default_log_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            target,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    LOG.setLevel(level)
+    for existing in list(LOG.handlers):
+        if isinstance(existing, logging.handlers.RotatingFileHandler):
+            LOG.removeHandler(existing)
+            existing.close()
+    LOG.addHandler(handler)
+    LOG.propagate = False
+    return target
+
+
+def enable_dpi_awareness() -> float:
+    """Opt the process into physical pixels and return the primary DPI scale.
+
+    Without this the Tk window lives in DPI-virtualised coordinates while every
+    ``user32`` rect we read (taskbar, monitors) is in physical pixels.  On any
+    display that is not at 100% the two spaces disagree, which is what makes the
+    HUD drift to the wrong place.
+    """
+
+    global _UI_SCALE
+    if os.name != "nt":
+        return _UI_SCALE
+
+    user32 = ctypes.windll.user32
+    aware = False
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        aware = bool(user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)))
+    except (AttributeError, OSError, ValueError):
+        aware = False
+    if not aware:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            aware = True
+        except (AttributeError, OSError, ValueError):
+            aware = False
+    if not aware:
+        try:
+            user32.SetProcessDPIAware()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    try:
+        get_dpi_for_window = user32.GetDpiForWindow
+        get_dpi_for_window.argtypes = [ctypes.c_void_p]
+        get_dpi_for_window.restype = ctypes.c_uint
+        dpi = int(get_dpi_for_window(ctypes.c_void_p(user32.GetDesktopWindow())))
+    except (AttributeError, OSError, ValueError):
+        dpi = 0
+    if dpi > 0:
+        _UI_SCALE = max(0.75, min(4.0, dpi / 96.0))
+    return _UI_SCALE
+
+
+def ui_scale() -> float:
+    return _UI_SCALE
+
+
+def _s(value: float) -> int:
+    """Scale a layout constant expressed at 96 DPI into physical pixels."""
+
+    return int(round(value * _UI_SCALE))
+
+
+def _configure_once(widget: tk.Widget, cache: dict[str, Any], **options: Any) -> None:
+    """Apply only the options that actually changed.
+
+    Rewriting a label with the value it already has still queues a redraw, and
+    on a layered (``-alpha``) window every redraw is a full composite — that is
+    the visible flicker.
+    """
+
+    changed = {key: value for key, value in options.items() if cache.get(key) != value}
+    if not changed:
+        return
+    try:
+        widget.configure(**changed)
+    except tk.TclError:
+        return
+    cache.update(changed)
 
 
 class CodexError(RuntimeError):
@@ -97,6 +256,7 @@ class UiMessage:
     kind: str
     snapshot: Optional[UsageSnapshot] = None
     detail: str = ""
+    source: str = SOURCE_CODEX
 
 
 @dataclass(frozen=True)
@@ -117,10 +277,14 @@ def default_settings_path() -> Path:
     return base / "CodexUsageWidget" / "settings.json"
 
 
+def default_snapshot_path() -> Path:
+    return default_settings_path().with_name("last_snapshot.json")
+
+
 class WindowStateStore:
     """Tolerant, atomic storage for non-sensitive HUD layout state."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = path or default_settings_path()
@@ -312,6 +476,14 @@ def _parse_group(raw: Any, fallback_id: Optional[str] = None) -> Optional[_RateG
     return _RateGroup(limit_id=limit_id, limit_name=limit_name, windows=windows)
 
 
+def default_snapshot_labels(source: str) -> tuple[str, str]:
+    """Return the ``(five_hour_label, weekly_label)`` pair for a source."""
+
+    if source == SOURCE_CLAUDE:
+        return "CL 5h", "CL 주"
+    return "CX 5h", "CX 주"
+
+
 def select_usage_windows(result: Mapping[str, Any]) -> UsageSnapshot:
     """Select only the default Codex weekly meter.
 
@@ -348,11 +520,154 @@ def select_usage_windows(result: Mapping[str, Any]) -> UsageSnapshot:
         five_hour=None,
         weekly=weekly,
         limit_id=canonical.limit_id if canonical is not None else None,
-        five_hour_label="5h",
-        weekly_label="Week",
+        five_hour_label="CX 5h",
+        weekly_label="CX 주",
         five_hour_limit_id=None,
         weekly_limit_id=canonical.limit_id if weekly is not None else None,
     )
+
+
+def select_claude_windows(result: Mapping[str, Any]) -> UsageSnapshot:
+    """Map the ``claude`` CLI ``get_usage`` payload onto a snapshot.
+
+    Only the two account-wide meters are displayed: the 5-hour session window
+    and the all-model weekly window.  Model-scoped weekly entries are ignored,
+    mirroring how the Codex side ignores its per-model meters.
+    """
+
+    rate_limits = result.get("rate_limits")
+    if not isinstance(rate_limits, Mapping):
+        rate_limits = {}
+
+    five_hour = None
+    parsed = parse_limit_window(rate_limits.get("five_hour"))
+    if parsed is not None:
+        five_hour = RateWindow(
+            used_percent=parsed[0],
+            window_duration_mins=FIVE_HOURS_MINS,
+            resets_at=parsed[1],
+        )
+
+    weekly = None
+    parsed = parse_limit_window(rate_limits.get("seven_day"))
+    if parsed is not None:
+        weekly = RateWindow(
+            used_percent=parsed[0],
+            window_duration_mins=ONE_WEEK_MINS,
+            resets_at=parsed[1],
+        )
+
+    return UsageSnapshot(
+        five_hour=five_hour,
+        weekly=weekly,
+        limit_id=SOURCE_CLAUDE,
+        five_hour_label="CL 5h",
+        weekly_label="CL 주",
+        five_hour_limit_id=SOURCE_CLAUDE if five_hour is not None else None,
+        weekly_limit_id=SOURCE_CLAUDE if weekly is not None else None,
+    )
+
+
+class UsageSnapshotStore:
+    """Persist only the last usage windows per source, never any credential."""
+
+    VERSION = 3
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path or default_snapshot_path()
+
+    @staticmethod
+    def _render_window(window: Optional[RateWindow]) -> Any:
+        if window is None:
+            return None
+        return {
+            "usedPercent": window.used_percent,
+            "windowDurationMins": window.window_duration_mins,
+            "resetsAt": window.resets_at,
+        }
+
+    @staticmethod
+    def _load_window(raw: Any, expected_minutes: int) -> Optional[RateWindow]:
+        window = _parse_window(raw)
+        if window is None or window.window_duration_mins != expected_minutes:
+            return None
+        return window
+
+    def load(self) -> dict[str, UsageSnapshot]:
+        """Return the cached snapshot per source; unknown data is dropped."""
+
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, Mapping) or raw.get("version") != self.VERSION:
+            return {}
+
+        sources = raw.get("sources")
+        if not isinstance(sources, Mapping):
+            return {}
+
+        snapshots: dict[str, UsageSnapshot] = {}
+        for source in SOURCES:
+            entry = sources.get(source)
+            if not isinstance(entry, Mapping):
+                continue
+            weekly = self._load_window(entry.get("weekly"), ONE_WEEK_MINS)
+            five_hour = self._load_window(entry.get("fiveHour"), FIVE_HOURS_MINS)
+            if weekly is None and five_hour is None:
+                continue
+            raw_limit_id = entry.get("limitId")
+            limit_id = str(raw_limit_id) if raw_limit_id is not None else None
+            defaults = default_snapshot_labels(source)
+            snapshots[source] = UsageSnapshot(
+                five_hour=five_hour,
+                weekly=weekly,
+                limit_id=limit_id,
+                five_hour_label=defaults[0],
+                weekly_label=defaults[1],
+                five_hour_limit_id=limit_id if five_hour is not None else None,
+                weekly_limit_id=limit_id if weekly is not None else None,
+            )
+        return snapshots
+
+    def save(self, snapshots: Mapping[str, UsageSnapshot]) -> bool:
+        sources: dict[str, Any] = {}
+        for source in SOURCES:
+            snapshot = snapshots.get(source)
+            if snapshot is None or not snapshot.available:
+                continue
+            sources[source] = {
+                "limitId": snapshot.weekly_limit_id
+                or snapshot.five_hour_limit_id
+                or snapshot.limit_id,
+                "weekly": self._render_window(snapshot.weekly),
+                "fiveHour": self._render_window(snapshot.five_hour),
+            }
+        if not sources:
+            return False
+
+        payload = {
+            "version": self.VERSION,
+            "savedAt": time.time(),
+            "sources": sources,
+        }
+        temp_path = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, self.path)
+            return True
+        except (OSError, UnicodeError, TypeError, ValueError):
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
 
 def format_percent(value: float) -> str:
@@ -422,9 +737,9 @@ def format_compact_reset_time(
 
     weekday = "월화수목금토일"[reset.weekday()]
     if reset.year == now.year:
-        return f"R {reset.month}/{reset.day}({weekday}) {reset.strftime('%H:%M')}"
+        return f"R {reset.month}/{reset.day}({weekday}){reset.strftime('%H:%M')}"
     return (
-        f"R {str(reset.year)[2:]}/{reset.month}/{reset.day}({weekday}) "
+        f"R {str(reset.year)[2:]}/{reset.month}/{reset.day}({weekday})"
         f"{reset.strftime('%H:%M')}"
     )
 
@@ -444,6 +759,25 @@ def resolve_codex_command() -> tuple[str, ...]:
             if candidate:
                 break
 
+    if candidate is None and os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            codex_bin_root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+            try:
+                installed_candidates = [
+                    path
+                    for path in codex_bin_root.glob("*/codex.exe")
+                    if path.is_file()
+                ]
+                installed_candidates.sort(
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                installed_candidates = []
+            if installed_candidates:
+                candidate = str(installed_candidates[0])
+
     if candidate is None:
         raise CodexConnectionError(
             "codex CLI를 찾을 수 없습니다. PATH에서 `codex --version`을 먼저 확인하세요."
@@ -460,7 +794,7 @@ class CodexAppServerClient:
         *,
         request_timeout: float = RPC_TIMEOUT_SECONDS,
     ) -> None:
-        self._command = tuple(command) if command is not None else resolve_codex_command()
+        self._command = tuple(command) if command is not None else None
         self._request_timeout = request_timeout
         self._state_lock = threading.Lock()
         self._request_lock = threading.Lock()
@@ -551,7 +885,8 @@ class CodexAppServerClient:
             raise
 
     def _spawn_connection(self) -> _Connection:
-        command = [*self._command, "app-server"]
+        base_command = self._command or resolve_codex_command()
+        command = [*base_command, "app-server"]
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             process = subprocess.Popen(
@@ -764,17 +1099,37 @@ class CodexAppServerClient:
 
 
 class UsagePoller(threading.Thread):
+    """Poll one usage source on its own thread.
+
+    Both sources share this loop; a failure on one never stops the other.  The
+    client only has to provide ``read_rate_limits``, ``is_disconnected`` and
+    ``shutdown``.
+    """
+
     def __init__(
         self,
-        client: CodexAppServerClient,
+        client: Any,
         output: "queue.Queue[UiMessage]",
         *,
+        source: str = SOURCE_CODEX,
+        parse: Callable[[Mapping[str, Any]], UsageSnapshot] = select_usage_windows,
+        unavailable_detail: str = "기본 Codex 주간 한도를 찾지 못했습니다.",
+        rpc_errors: tuple[type[BaseException], ...] = (CodexRpcError,),
+        connection_errors: tuple[type[BaseException], ...] = (
+            CodexConnectionError,
+            OSError,
+        ),
         refresh_seconds: float = REFRESH_SECONDS,
         reconnect_delays: Sequence[float] = RECONNECT_DELAYS_SECONDS,
     ) -> None:
-        super().__init__(name="codex-usage-poller", daemon=True)
+        super().__init__(name=f"{source}-usage-poller", daemon=True)
         self.client = client
         self.output = output
+        self.source = source
+        self.parse = parse
+        self.unavailable_detail = unavailable_detail
+        self.rpc_errors = rpc_errors
+        self.connection_errors = connection_errors
         self.refresh_seconds = refresh_seconds
         self.reconnect_delays = tuple(reconnect_delays) or (1.0,)
         self.stop_event = threading.Event()
@@ -799,26 +1154,33 @@ class UsagePoller(threading.Thread):
             while not self.stop_event.is_set():
                 try:
                     result = self.client.read_rate_limits()
-                    snapshot = select_usage_windows(result)
+                    snapshot = self.parse(result)
                     if snapshot.available:
-                        self.output.put(UiMessage("snapshot", snapshot=snapshot))
+                        self.output.put(
+                            UiMessage("snapshot", snapshot=snapshot, source=self.source)
+                        )
                     else:
                         self.output.put(
                             UiMessage(
                                 "unavailable",
-                                detail="기본 Codex 주간 한도를 찾지 못했습니다.",
+                                detail=self.unavailable_detail,
+                                source=self.source,
                             )
                         )
                     failure_count = 0
                     if self._wait_or_disconnect(self.refresh_seconds):
                         break
-                except CodexRpcError as exc:
-                    self.output.put(UiMessage("error", detail=str(exc)))
+                except self.rpc_errors as exc:
+                    self.output.put(
+                        UiMessage("error", detail=str(exc), source=self.source)
+                    )
                     failure_count = 0
                     if self.stop_event.wait(self.refresh_seconds):
                         break
-                except (CodexConnectionError, OSError) as exc:
-                    self.output.put(UiMessage("reconnecting", detail=str(exc)))
+                except self.connection_errors as exc:
+                    self.output.put(
+                        UiMessage("reconnecting", detail=str(exc), source=self.source)
+                    )
                     delay = self.reconnect_delays[
                         min(failure_count, len(self.reconnect_delays) - 1)
                     ]
@@ -829,8 +1191,20 @@ class UsagePoller(threading.Thread):
             self.client.shutdown()
 
 
+def remaining_color(window: RateWindow) -> str:
+    progress = window.progress_percent
+    return GREEN if progress >= 50 else AMBER if progress >= 20 else RED
+
+
 class UsageRow:
     def __init__(self, parent: tk.Widget, y: int, label: str) -> None:
+        self._label_cache: dict[str, Any] = {}
+        self._percent_cache: dict[str, Any] = {}
+        self._reset_cache: dict[str, Any] = {}
+        self._fill_width: Optional[int] = None
+        self._fill_color: Optional[str] = None
+        self.title = label
+
         self.label = tk.Label(
             parent,
             text=label,
@@ -839,7 +1213,7 @@ class UsageRow:
             font=("Segoe UI Semibold", 10),
             anchor="w",
         )
-        self.label.place(x=10, y=y, width=55, height=18)
+        self.label.place(x=_s(10), y=_s(y), width=_s(80), height=_s(18))
 
         self.percent = tk.Label(
             parent,
@@ -849,7 +1223,7 @@ class UsageRow:
             font=("Segoe UI Semibold", 10),
             anchor="e",
         )
-        self.percent.place(x=190, y=y, width=78, height=18)
+        self.percent.place(x=_s(190), y=_s(y), width=_s(78), height=_s(18))
 
         self.bar = tk.Canvas(
             parent,
@@ -857,8 +1231,13 @@ class UsageRow:
             highlightthickness=0,
             bd=0,
         )
-        self.bar.place(x=10, y=y + 21, width=258, height=6)
-        self.fill = self.bar.create_rectangle(0, 0, 0, 6, fill=GREEN, outline="")
+        self.bar.place(
+            x=_s(10),
+            y=_s(y + 21),
+            width=_s(DETAIL_BAR_WIDTH),
+            height=_s(6),
+        )
+        self.fill = self.bar.create_rectangle(0, 0, 0, _s(6), fill=GREEN, outline="")
 
         self.reset = tk.Label(
             parent,
@@ -868,25 +1247,43 @@ class UsageRow:
             font=("Segoe UI", 8),
             anchor="e",
         )
-        self.reset.place(x=90, y=y + 29, width=178, height=14)
+        self.reset.place(x=_s(90), y=_s(y + 29), width=_s(178), height=_s(14))
 
     def set_title(self, title: str) -> None:
-        self.label.configure(text=title)
+        self.title = title
+        _configure_once(self.label, self._label_cache, text=title)
+
+    def _set_fill(self, width: int, color: str) -> None:
+        if width != self._fill_width:
+            self.bar.coords(self.fill, 0, 0, width, _s(6))
+            self._fill_width = width
+        if color != self._fill_color:
+            self.bar.itemconfigure(self.fill, fill=color)
+            self._fill_color = color
 
     def set_window(self, window: Optional[RateWindow]) -> None:
         if window is None:
-            self.percent.configure(text="—", fg=MUTED)
-            self.reset.configure(text="Reset —")
-            self.bar.coords(self.fill, 0, 0, 0, 6)
+            _configure_once(self.percent, self._percent_cache, text="—", fg=MUTED)
+            _configure_once(self.reset, self._reset_cache, text="Reset —")
+            self._set_fill(0, self._fill_color or GREEN)
             return
 
-        remaining = window.remaining_percent
-        progress = window.progress_percent
-        color = GREEN if progress >= 50 else AMBER if progress >= 20 else RED
-        self.percent.configure(text=format_percent(remaining), fg=color)
-        self.reset.configure(text=format_reset_time(window.resets_at))
-        self.bar.coords(self.fill, 0, 0, round(258 * progress / 100.0), 6)
-        self.bar.itemconfigure(self.fill, fill=color)
+        color = remaining_color(window)
+        _configure_once(
+            self.percent,
+            self._percent_cache,
+            text=format_percent(window.remaining_percent),
+            fg=color,
+        )
+        _configure_once(
+            self.reset,
+            self._reset_cache,
+            text=format_reset_time(window.resets_at),
+        )
+        self._set_fill(
+            round(_s(DETAIL_BAR_WIDTH) * window.progress_percent / 100.0),
+            color,
+        )
 
 
 class CompactUsage:
@@ -901,6 +1298,10 @@ class CompactUsage:
     ) -> None:
         self.prefix = label
         self.width = width
+        self._window: Optional[RateWindow] = None
+        self._label_cache: dict[str, Any] = {}
+        self._reset_cache: dict[str, Any] = {}
+
         self.label = tk.Label(
             parent,
             text=f"{label} —",
@@ -909,7 +1310,7 @@ class CompactUsage:
             font=("Segoe UI Semibold", 8),
             anchor="w",
         )
-        self.label.place(x=x, y=1, width=width, height=17)
+        self.label.place(x=_s(x), y=_s(1), width=_s(width), height=_s(17))
 
         self.reset = tk.Label(
             parent,
@@ -919,25 +1320,48 @@ class CompactUsage:
             font=("Segoe UI Semibold", 7),
             anchor="w",
         )
-        self.reset.place(x=x, y=17, width=reset_width or width, height=12)
+        self.reset.place(
+            x=_s(x),
+            y=_s(17),
+            width=_s(reset_width or width),
+            height=_s(12),
+        )
 
     def set_prefix(self, prefix: str) -> None:
+        """Change the caption without blanking the value already on screen."""
+
+        if prefix == self.prefix:
+            return
         self.prefix = prefix
-        self.label.configure(text=f"{prefix} —")
+        self._render()
 
     def set_window(self, window: Optional[RateWindow]) -> None:
+        self._window = window
+        self._render()
+
+    def _render(self) -> None:
+        window = self._window
         if window is None:
-            self.label.configure(text=f"{self.prefix} —", fg=MUTED)
-            self.reset.configure(text="R —")
+            _configure_once(
+                self.label,
+                self._label_cache,
+                text=f"{self.prefix} —",
+                fg=MUTED,
+            )
+            _configure_once(self.reset, self._reset_cache, text="R —")
             return
 
-        progress = window.progress_percent
-        color = GREEN if progress >= 50 else AMBER if progress >= 20 else RED
-        self.label.configure(
+        _configure_once(
+            self.label,
+            self._label_cache,
             text=f"{self.prefix} {format_percent(window.remaining_percent)}",
-            fg=color,
+            fg=remaining_color(window),
         )
-        self.reset.configure(text=format_compact_reset_time(window.resets_at))
+        _configure_once(
+            self.reset,
+            self._reset_cache,
+            text=format_compact_reset_time(window.resets_at),
+        )
 
 
 class _Rect(ctypes.Structure):
@@ -947,6 +1371,49 @@ class _Rect(ctypes.Structure):
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
     ]
+
+
+class _AppBarData(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("hWnd", ctypes.c_void_p),
+        ("uCallbackMessage", ctypes.c_uint32),
+        ("uEdge", ctypes.c_uint32),
+        ("rc", _Rect),
+        ("lParam", ctypes.c_ssize_t),
+    ]
+
+
+def _taskbar_autohidden() -> bool:
+    """True when the taskbar is in auto-hide mode.
+
+    An auto-hidden taskbar still reports ``IsWindowVisible``, but its rect sits
+    mostly off-screen, so anchoring to it parks the HUD where nobody can see it.
+    """
+
+    if os.name != "nt":
+        return False
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.SHAppBarMessage.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(_AppBarData),
+        ]
+        shell32.SHAppBarMessage.restype = ctypes.c_ssize_t
+        data = _AppBarData()
+        data.cbSize = ctypes.sizeof(_AppBarData)
+        state = shell32.SHAppBarMessage(0x00000004, ctypes.byref(data))  # ABM_GETSTATE
+        return bool(int(state) & 0x00000001)  # ABS_AUTOHIDE
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def compact_size() -> tuple[int, int]:
+    return _s(COMPACT_WIDTH), _s(COMPACT_HEIGHT)
+
+
+def detail_size() -> tuple[int, int]:
+    return _s(WINDOW_WIDTH), _s(WINDOW_HEIGHT)
 
 
 @dataclass(frozen=True)
@@ -990,6 +1457,8 @@ def _taskbar_layout() -> Optional[_TaskbarLayout]:
         taskbar = find_window("Shell_TrayWnd", None)
         if not taskbar or not is_window_visible(taskbar):
             return None
+        if _taskbar_autohidden():
+            return None
 
         rect = _Rect()
         if not get_window_rect(taskbar, ctypes.byref(rect)):
@@ -1022,8 +1491,7 @@ def _taskbar_layout() -> Optional[_TaskbarLayout]:
         return None
 
 
-def _initial_position(root: tk.Tk) -> tuple[int, int]:
-    margin = 18
+def _work_area(root: tk.Tk) -> tuple[int, int, int, int]:
     left = 0
     top = 0
     right = root.winfo_screenwidth()
@@ -1036,25 +1504,36 @@ def _initial_position(root: tk.Tk) -> tuple[int, int]:
                 left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
         except (AttributeError, OSError):
             pass
+    return left, top, right, bottom
 
-    x = max(left, right - WINDOW_WIDTH - margin)
-    y = max(top, bottom - WINDOW_HEIGHT - margin)
+
+def _initial_position(root: tk.Tk) -> tuple[int, int]:
+    margin = _s(18)
+    width, height = detail_size()
+    left, top, right, bottom = _work_area(root)
+
+    x = max(left, right - width - margin)
+    y = max(top, bottom - height - margin)
     return x, y
 
 
 def _compact_initial_position(root: tk.Tk) -> tuple[int, int]:
+    width, height = compact_size()
     layout = _taskbar_layout()
     if layout is not None and layout.horizontal:
         scale = max(0.75, layout.dpi / 96.0)
         x = layout.left + round(162 * scale)
         if layout.task_buttons_left is not None:
-            x = min(x, layout.task_buttons_left - COMPACT_WIDTH - round(12 * scale))
-        x = max(layout.left + 6, min(x, layout.right - COMPACT_WIDTH - 6))
-        y = layout.top + max(0, (layout.bottom - layout.top - COMPACT_HEIGHT) // 2)
+            x = min(x, layout.task_buttons_left - width - round(12 * scale))
+        x = max(layout.left + 6, min(x, layout.right - width - 6))
+        y = layout.top + max(0, (layout.bottom - layout.top - height) // 2)
         return x, y
 
-    x = max(0, root.winfo_screenwidth() - COMPACT_WIDTH - 18)
-    y = max(0, root.winfo_screenheight() - COMPACT_HEIGHT - 18)
+    # No usable taskbar (vertical, hidden, or auto-hide): sit just above the
+    # bottom edge of the work area so the HUD stays visible either way.
+    left, top, right, bottom = _work_area(root)
+    x = max(left, right - width - _s(18))
+    y = max(top, bottom - height - _s(4))
     return x, y
 
 
@@ -1143,8 +1622,118 @@ def _restore_visible_position(
     )
 
 
-def _raise_window_above_taskbar(root: tk.Tk) -> bool:
-    """Reassert the HUD at the top of the topmost band without activation."""
+def _window_handle(root: tk.Tk) -> Optional[int]:
+    """Resolve this HUD's own top-level HWND.
+
+    ``wm frame`` is Tk's own answer and the only reliable one here: ``winfo_id``
+    returns the inner Tk window, and ``GetAncestor(GA_ROOT)`` on it comes back
+    unchanged rather than reaching the ``TkTopLevel`` wrapper that actually owns
+    the z-order.  Looking the window up by title is not an option either --
+    ``FindWindowW(None, title)`` matches the first window in the whole session
+    with that caption, which may belong to another process entirely.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        frame = root.wm_frame()
+        if frame:
+            handle = int(frame, 16)
+            if _is_window(handle):
+                return handle
+    except (tk.TclError, TypeError, ValueError):
+        pass
+
+    try:
+        user32 = ctypes.windll.user32
+        get_ancestor = user32.GetAncestor
+        get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        get_ancestor.restype = ctypes.c_void_p
+        inner = root.winfo_id()
+        handle = get_ancestor(ctypes.c_void_p(inner), 2) or inner  # GA_ROOT
+        return int(handle) if handle else None
+    except (AttributeError, OSError, ValueError, tk.TclError):
+        return None
+
+
+def _is_window(handle: Optional[int]) -> bool:
+    if not handle or os.name != "nt":
+        return False
+    try:
+        is_window = ctypes.windll.user32.IsWindow
+        is_window.argtypes = [ctypes.c_void_p]
+        is_window.restype = ctypes.c_bool
+        return bool(is_window(ctypes.c_void_p(handle)))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _has_topmost_style(handle: int) -> bool:
+    try:
+        user32 = ctypes.windll.user32
+        get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_long.restype = ctypes.c_ssize_t
+        ex_style = int(get_long(ctypes.c_void_p(handle), -20))  # GWL_EXSTYLE
+        return bool(ex_style & 0x00000008)  # WS_EX_TOPMOST
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _window_is_covered(handle: Optional[int]) -> bool:
+    """True when something else owns the pixels at the centre of the HUD.
+
+    ``WS_EX_TOPMOST`` staying set is not proof of visibility: ``Shell_TrayWnd``
+    is topmost too, and after it redraws it can sit above us inside the same
+    band.  Asking who owns our own centre point is the only check that matches
+    what the user actually sees.
+    """
+
+    if not handle or os.name != "nt":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        rect = _Rect()
+        get_window_rect = user32.GetWindowRect
+        get_window_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Rect)]
+        get_window_rect.restype = ctypes.c_bool
+        if not get_window_rect(ctypes.c_void_p(handle), ctypes.byref(rect)):
+            return False
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return False
+
+        class _Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        point = _Point(
+            (rect.left + rect.right) // 2,
+            (rect.top + rect.bottom) // 2,
+        )
+        window_from_point = user32.WindowFromPoint
+        window_from_point.argtypes = [_Point]
+        window_from_point.restype = ctypes.c_void_p
+        hit = window_from_point(point)
+        if not hit:
+            return False
+
+        get_ancestor = user32.GetAncestor
+        get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        get_ancestor.restype = ctypes.c_void_p
+        root_hit = get_ancestor(ctypes.c_void_p(hit), 2) or hit  # GA_ROOT
+        return int(root_hit) != int(handle)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _raise_window_above_taskbar(root: tk.Tk, handle: Optional[int] = None) -> bool:
+    """Reassert the HUD at the top of the topmost band without activation.
+
+    ``SWP_SHOWWINDOW`` is required here: ``SetWindowPos(HWND_TOPMOST)`` on a
+    window that already carries ``WS_EX_TOPMOST`` does not move it inside the
+    band, so without it the taskbar stays on top.  It repaints a layered
+    window, which is why callers only reach this when the HUD is really
+    covered rather than on every timer tick.
+    """
 
     if os.name != "nt":
         try:
@@ -1153,12 +1742,13 @@ def _raise_window_above_taskbar(root: tk.Tk) -> bool:
         except tk.TclError:
             return False
 
+    if handle is None:
+        handle = _window_handle(root)
+    if not handle:
+        return False
+
     try:
-        root.update_idletasks()
         user32 = ctypes.windll.user32
-        get_ancestor = user32.GetAncestor
-        get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        get_ancestor.restype = ctypes.c_void_p
         set_window_pos = user32.SetWindowPos
         set_window_pos.argtypes = [
             ctypes.c_void_p,
@@ -1170,25 +1760,17 @@ def _raise_window_above_taskbar(root: tk.Tk) -> bool:
             ctypes.c_uint,
         ]
         set_window_pos.restype = ctypes.c_bool
-
-        find_window = user32.FindWindowW
-        find_window.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-        find_window.restype = ctypes.c_void_p
-
-        inner_handle = ctypes.c_void_p(root.winfo_id())
-        top_handle = find_window(None, root.title())
-        if not top_handle:
-            top_handle = get_ancestor(inner_handle, 2) or inner_handle.value  # GA_ROOT
+        # NOSIZE | NOMOVE | NOACTIVATE | SHOWWINDOW
         flags = 0x0001 | 0x0002 | 0x0010 | 0x0040
         return bool(
             set_window_pos(
-                top_handle,
+                ctypes.c_void_p(handle),
                 ctypes.c_void_p(-1),  # HWND_TOPMOST
                 0,
                 0,
                 0,
                 0,
-                flags,  # NOSIZE | NOMOVE | NOACTIVATE | SHOWWINDOW
+                flags,
             )
         )
     except (AttributeError, OSError, ValueError, tk.TclError):
@@ -1201,20 +1783,60 @@ class CodexUsageWidget:
         root: tk.Tk,
         *,
         client: Optional[CodexAppServerClient] = None,
+        claude_client: Optional[Any] = None,
         autostart: bool = True,
         state_store: Optional[WindowStateStore] = None,
         persist_state: bool = True,
+        snapshot_store: Optional[UsageSnapshotStore] = None,
+        persist_snapshot: Optional[bool] = None,
+        alert_tracker: Optional[AlertTracker] = None,
+        notifier: Optional[TrayNotifier] = None,
+        alerts_enabled: bool = True,
     ) -> None:
         self.root = root
         self.client = client or CodexAppServerClient()
+        self.claude_client = claude_client or ClaudeUsageClient()
         self.messages: "queue.Queue[UiMessage]" = queue.Queue()
         self.poller = UsagePoller(self.client, self.messages)
+        self.claude_poller = UsagePoller(
+            self.claude_client,
+            self.messages,
+            source=SOURCE_CLAUDE,
+            parse=select_claude_windows,
+            unavailable_detail="Claude 구독 한도를 찾지 못했습니다.",
+            rpc_errors=(ClaudeUnavailableError,),
+            connection_errors=(ClaudeConnectionError, ClaudeUsageError, OSError),
+            refresh_seconds=CLAUDE_REFRESH_SECONDS,
+        )
         self._closed = False
         self._drag_offset = (0, 0)
+        self._position: Optional[tuple[int, int]] = None
         self._after_id: Optional[str] = None
         self._topmost_after_id: Optional[str] = None
+        self._display_after_id: Optional[str] = None
+        self._save_after_id: Optional[str] = None
+        self._flash_after_id: Optional[str] = None
+        self._notify_after_id: Optional[str] = None
+        self._hwnd: Optional[int] = None
+        self._raise_failures = 0
+        self._last_raise_log = 0.0
+        self._covered_raises = 0
+        self.alerts_enabled = alerts_enabled
+        self.alert_tracker = alert_tracker or AlertTracker()
+        self.notifier = notifier or TrayNotifier()
         self._persist_state = persist_state
         self.state_store = state_store or WindowStateStore()
+        self._persist_snapshot = (
+            persist_state if persist_snapshot is None else persist_snapshot
+        )
+        self.snapshot_store = snapshot_store or UsageSnapshotStore()
+        self._snapshots: dict[str, UsageSnapshot] = (
+            self.snapshot_store.load() if self._persist_snapshot else {}
+        )
+        self._source_status: dict[str, str] = {
+            source: "cached" if source in self._snapshots else "pending"
+            for source in SOURCES
+        }
         self._window_state = (
             self.state_store.load() if self._persist_state else None
         ) or WindowState()
@@ -1242,13 +1864,13 @@ class CodexUsageWidget:
 
         self.title_label = tk.Label(
             self.detail_panel,
-            text="CODEX USAGE",
+            text="USAGE 남은 %",
             bg=BG,
             fg=TEXT,
             font=("Segoe UI Semibold", 9),
             anchor="w",
         )
-        self.title_label.place(x=10, y=5, width=105, height=19)
+        self.title_label.place(x=_s(10), y=_s(5), width=_s(105), height=_s(19))
 
         self.status_label = tk.Label(
             self.detail_panel,
@@ -1258,7 +1880,9 @@ class CodexUsageWidget:
             font=("Segoe UI", 7),
             anchor="e",
         )
-        self.status_label.place(x=116, y=6, width=94, height=17)
+        self.status_label.place(x=_s(116), y=_s(6), width=_s(94), height=_s(17))
+        self._status_cache: dict[str, Any] = {}
+        self._compact_status_cache: dict[str, Any] = {}
 
         self.detail_toggle_button = tk.Button(
             self.detail_panel,
@@ -1274,7 +1898,7 @@ class CodexUsageWidget:
             cursor="hand2",
             takefocus=False,
         )
-        self.detail_toggle_button.place(x=214, y=2, width=28, height=24)
+        self.detail_toggle_button.place(x=_s(214), y=_s(2), width=_s(28), height=_s(24))
 
         self.close_button = tk.Button(
             self.detail_panel,
@@ -1290,9 +1914,17 @@ class CodexUsageWidget:
             cursor="hand2",
             takefocus=False,
         )
-        self.close_button.place(x=244, y=2, width=28, height=24)
+        self.close_button.place(x=_s(244), y=_s(2), width=_s(28), height=_s(24))
 
-        self.weekly_row = UsageRow(self.detail_panel, 54, "Week left")
+        codex_labels = default_snapshot_labels(SOURCE_CODEX)
+        claude_labels = default_snapshot_labels(SOURCE_CLAUDE)
+        self.weekly_row = UsageRow(self.detail_panel, DETAIL_ROW_YS[0], codex_labels[1])
+        self.claude_five_hour_row = UsageRow(
+            self.detail_panel, DETAIL_ROW_YS[1], claude_labels[0]
+        )
+        self.claude_weekly_row = UsageRow(
+            self.detail_panel, DETAIL_ROW_YS[2], claude_labels[1]
+        )
 
         self.compact_panel = tk.Frame(
             root,
@@ -1308,13 +1940,27 @@ class CodexUsageWidget:
             font=("Segoe UI", 7),
             anchor="center",
         )
-        self.compact_status.place(x=3, y=3, width=9, height=13)
+        self.compact_status.place(x=_s(3), y=_s(3), width=_s(9), height=_s(13))
         self.compact_weekly = CompactUsage(
             self.compact_panel,
-            13,
-            60,
-            "Week",
-            reset_width=99,
+            COMPACT_COLUMN_XS[0],
+            COMPACT_COLUMN_WIDTH,
+            codex_labels[1],
+            reset_width=COMPACT_RESET_WIDTH,
+        )
+        self.compact_claude_five_hour = CompactUsage(
+            self.compact_panel,
+            COMPACT_COLUMN_XS[1],
+            COMPACT_COLUMN_WIDTH,
+            claude_labels[0],
+            reset_width=COMPACT_RESET_WIDTH,
+        )
+        self.compact_claude_weekly = CompactUsage(
+            self.compact_panel,
+            COMPACT_COLUMN_XS[2],
+            COMPACT_COLUMN_WIDTH,
+            claude_labels[1],
+            reset_width=COMPACT_RESET_WIDTH,
         )
         self.compact_toggle_button = tk.Button(
             self.compact_panel,
@@ -1330,7 +1976,9 @@ class CodexUsageWidget:
             cursor="hand2",
             takefocus=False,
         )
-        self.compact_toggle_button.place(x=74, y=0, width=18, height=17)
+        self.compact_toggle_button.place(
+            x=_s(COMPACT_WIDTH - 40), y=0, width=_s(18), height=_s(17)
+        )
         self.compact_close_button = tk.Button(
             self.compact_panel,
             text="×",
@@ -1345,7 +1993,9 @@ class CodexUsageWidget:
             cursor="hand2",
             takefocus=False,
         )
-        self.compact_close_button.place(x=94, y=0, width=18, height=17)
+        self.compact_close_button.place(
+            x=_s(COMPACT_WIDTH - 20), y=0, width=_s(18), height=_s(17)
+        )
 
         self._compact_mode = self._window_state.compact_mode
         self._bind_drag_widgets(self.detail_panel)
@@ -1358,10 +2008,24 @@ class CodexUsageWidget:
         else:
             self.show_details(initial=True)
 
+        self._render_all()
+        self._render_status()
+        self._seed_alerts_from_cache()
+
+        self._display_signature = self._current_display_signature()
+        LOG.info(
+            "HUD ready: mode=%s position=%s scale=%.2f cached=%s",
+            "compact" if self._compact_mode else "detail",
+            self._position,
+            ui_scale(),
+            sorted(self._snapshots),
+        )
         self._refresh_topmost()
         self._after_id = root.after(100, self._drain_messages)
+        self._display_after_id = root.after(DISPLAY_WATCH_MS, self._watch_display)
         if autostart:
             self.poller.start()
+            self.claude_poller.start()
 
     def _bind_drag_widgets(self, widget: tk.Widget) -> None:
         if not isinstance(widget, tk.Button):
@@ -1374,35 +2038,26 @@ class CodexUsageWidget:
     def show_compact(self, *, initial: bool = False) -> None:
         if self._closed:
             return
-        was_compact = self._compact_mode
         if not initial:
             self._remember_current_position()
 
+        width, height = compact_size()
+        # A saved position is the user's choice: honour it in every case, and
+        # only fall back to the taskbar slot when there is nothing usable saved.
         saved = _restore_visible_position(
             self.root,
             self._window_state.compact_position,
-            COMPACT_WIDTH,
-            COMPACT_HEIGHT,
+            width,
+            height,
         )
-        if saved is not None and (initial or not was_compact):
+        if saved is not None:
             x, y = saved
-        elif initial:
-            x, y = _compact_initial_position(self.root)
         else:
-            self.root.update_idletasks()
-            x = self.root.winfo_x()
-            layout = _taskbar_layout()
-            if layout is not None and layout.horizontal:
-                x = max(layout.left + 6, min(x, layout.right - COMPACT_WIDTH - 6))
-                y = layout.top + max(
-                    0, (layout.bottom - layout.top - COMPACT_HEIGHT) // 2
-                )
-            else:
-                _, y = _compact_initial_position(self.root)
+            x, y = _compact_initial_position(self.root)
 
         self.detail_panel.place_forget()
-        self.compact_panel.place(x=0, y=0, width=COMPACT_WIDTH, height=COMPACT_HEIGHT)
-        self._set_window_geometry(COMPACT_WIDTH, COMPACT_HEIGHT, x, y)
+        self.compact_panel.place(x=0, y=0, width=width, height=height)
+        self._set_window_geometry(width, height, x, y)
         self._compact_mode = True
         self._window_state = replace(
             self._window_state,
@@ -1415,36 +2070,24 @@ class CodexUsageWidget:
     def show_details(self, *, initial: bool = False) -> None:
         if self._closed:
             return
-        was_compact = self._compact_mode
         if not initial:
             self._remember_current_position()
 
+        width, height = detail_size()
         saved = _restore_visible_position(
             self.root,
             self._window_state.detail_position,
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
+            width,
+            height,
         )
-        if saved is not None and (initial or was_compact):
+        if saved is not None:
             x, y = saved
-        elif initial:
-            x, y = _initial_position(self.root)
         else:
-            self.root.update_idletasks()
-            x = self.root.winfo_x()
-            layout = _taskbar_layout()
-            if layout is not None and layout.horizontal:
-                x = max(layout.left, min(x, layout.right - WINDOW_WIDTH))
-                if layout.top >= self.root.winfo_screenheight() // 2:
-                    y = layout.top - WINDOW_HEIGHT - 8
-                else:
-                    y = layout.bottom + 8
-            else:
-                x, y = _initial_position(self.root)
+            x, y = _initial_position(self.root)
 
         self.compact_panel.place_forget()
-        self.detail_panel.place(x=0, y=0, width=WINDOW_WIDTH, height=WINDOW_HEIGHT)
-        self._set_window_geometry(WINDOW_WIDTH, WINDOW_HEIGHT, x, y)
+        self.detail_panel.place(x=0, y=0, width=width, height=height)
+        self._set_window_geometry(width, height, x, y)
         self._compact_mode = False
         self._window_state = replace(
             self._window_state,
@@ -1455,44 +2098,139 @@ class CodexUsageWidget:
             self._save_window_state()
 
     def _set_window_geometry(self, width: int, height: int, x: int, y: int) -> None:
-        self.root.resizable(True, True)
+        # ``overrideredirect`` windows are not user-resizable, so the old
+        # resizable(True)/update/resizable(False) dance only produced a visible
+        # jump on every mode switch.
         self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
-        self.root.update_idletasks()
-        self.root.resizable(False, False)
-        _raise_window_above_taskbar(self.root)
+        self._position = (x, y)
+        _raise_window_above_taskbar(self.root, self._handle())
+
+    def _handle(self) -> Optional[int]:
+        # Resolved fresh every time on purpose: before the window is first
+        # mapped ``wm frame`` still reports the inner Tk window, and that stale
+        # value stays a valid HWND forever, so caching it would silently pin us
+        # to a window that owns no z-order.  The lookup is a single Tcl call.
+        self._hwnd = _window_handle(self.root)
+        return self._hwnd
 
     def _refresh_topmost(self) -> None:
+        """Keep the HUD in the topmost band, and never stop trying."""
+
         if self._closed:
             return
         try:
-            self.root.attributes("-topmost", True)
-        except tk.TclError:
+            handle = self._handle()
+            if handle is None or not _has_topmost_style(handle):
+                self.root.attributes("-topmost", True)
+                needs_raise = True
+            else:
+                # Cheap check every tick; the expensive, repainting raise only
+                # happens when the HUD is actually hidden behind something.
+                needs_raise = _window_is_covered(handle)
+
+            if needs_raise:
+                self._covered_raises += 1
+                if _raise_window_above_taskbar(self.root, handle):
+                    self._raise_failures = 0
+                else:
+                    self._raise_failures += 1
+                    self._hwnd = None
+                self._log_raise_activity()
+        except (tk.TclError, OSError, ValueError) as exc:
+            self._raise_failures += 1
+            self._hwnd = None
+            LOG.warning("topmost refresh failed: %s", exc)
+        finally:
+            if not self._closed:
+                self._topmost_after_id = self.root.after(
+                    TOPMOST_REFRESH_MS,
+                    self._refresh_topmost,
+                )
+
+    def _log_raise_activity(self) -> None:
+        """Summarise z-order work at most once a minute.
+
+        A fullscreen app can keep the HUD covered, so this must never log per
+        tick -- but a silent HUD that keeps re-raising is exactly the evidence
+        needed the next time it misbehaves.
+        """
+
+        now = time.monotonic()
+        if now - self._last_raise_log < RAISE_LOG_INTERVAL_SECONDS:
             return
-        _raise_window_above_taskbar(self.root)
-        self._topmost_after_id = self.root.after(
-            TOPMOST_REFRESH_MS,
-            self._refresh_topmost,
+        self._last_raise_log = now
+        LOG.info(
+            "re-raised above covering window (%d raise(s), %d failure(s) since last report)",
+            self._covered_raises,
+            self._raise_failures,
         )
+        self._covered_raises = 0
+
+    def _current_display_signature(self) -> tuple[Any, ...]:
+        try:
+            monitors = tuple(_monitor_rectangles(self.root))
+        except (tk.TclError, OSError, ValueError):
+            return ()
+        layout = _taskbar_layout()
+        taskbar = (
+            (layout.left, layout.top, layout.right, layout.bottom, layout.dpi)
+            if layout is not None
+            else None
+        )
+        return (monitors, taskbar)
+
+    def _watch_display(self) -> None:
+        """Re-place the HUD when the monitor layout or taskbar actually moves."""
+
+        if self._closed:
+            return
+        try:
+            signature = self._current_display_signature()
+            if signature and signature != self._display_signature:
+                LOG.info(
+                    "display layout changed: %s -> %s",
+                    self._display_signature,
+                    signature,
+                )
+                self._display_signature = signature
+                if self._compact_mode:
+                    self.show_compact()
+                else:
+                    self.show_details()
+        except (tk.TclError, OSError, ValueError) as exc:
+            LOG.warning("display watch failed: %s", exc)
+        finally:
+            if not self._closed:
+                self._display_after_id = self.root.after(
+                    DISPLAY_WATCH_MS,
+                    self._watch_display,
+                )
 
     def _start_drag(self, event: tk.Event[Any]) -> None:
-        self._drag_offset = (
-            event.x_root - self.root.winfo_x(),
-            event.y_root - self.root.winfo_y(),
-        )
+        origin = self._position or (self.root.winfo_x(), self.root.winfo_y())
+        self._drag_offset = (event.x_root - origin[0], event.y_root - origin[1])
 
     def _drag(self, event: tk.Event[Any]) -> None:
         x = event.x_root - self._drag_offset[0]
         y = event.y_root - self._drag_offset[1]
         self.root.geometry(f"{x:+d}{y:+d}")
+        self._position = (x, y)
 
     def _finish_drag(self, _event: Optional[tk.Event[Any]] = None) -> None:
+        # A drag can end off-screen; snap back before the position is stored.
+        width, height = compact_size() if self._compact_mode else detail_size()
+        current = self._position
+        fitted = _restore_visible_position(self.root, current, width, height)
+        if fitted is not None and fitted != current:
+            self.root.geometry(f"{fitted[0]:+d}{fitted[1]:+d}")
+            self._position = fitted
         self._save_window_state()
 
     def _remember_current_position(self) -> None:
-        try:
-            self.root.update_idletasks()
-            position = (self.root.winfo_x(), self.root.winfo_y())
-        except tk.TclError:
+        # Track our own position instead of asking Tk: ``winfo_x`` lags behind a
+        # geometry request until the window manager processes it.
+        position = self._position
+        if position is None:
             return
         if self._compact_mode:
             self._window_state = replace(
@@ -1516,77 +2254,282 @@ class CodexUsageWidget:
     def _drain_messages(self) -> None:
         if self._closed:
             return
-        latest: Optional[UiMessage] = None
+        # Keep the newest message per source: a Codex update must not be thrown
+        # away just because a Claude message arrived in the same tick.
+        latest: dict[str, UiMessage] = {}
         while True:
             try:
-                latest = self.messages.get_nowait()
+                message = self.messages.get_nowait()
             except queue.Empty:
                 break
+            latest[message.source] = message
 
-        if latest is not None:
-            self._apply_message(latest)
+        for source in SOURCES:
+            message = latest.get(source)
+            if message is not None:
+                self._apply_message(message)
         self._after_id = self.root.after(150, self._drain_messages)
 
     def _apply_message(self, message: UiMessage) -> None:
+        source = message.source
+        previous_status = self._source_status.get(source)
         if message.kind == "snapshot" and message.snapshot is not None:
-            self.weekly_row.set_title(f"{message.snapshot.weekly_label} left")
-            self.compact_weekly.set_prefix(message.snapshot.weekly_label)
-            self.weekly_row.set_window(message.snapshot.weekly)
-            self.status_label.configure(text="LIVE", fg=GREEN)
-            self.compact_weekly.set_window(message.snapshot.weekly)
-            self.compact_status.configure(fg=GREEN)
+            self._snapshots[source] = message.snapshot
+            self._source_status[source] = "live"
+            self._render_source(source)
+            self._schedule_snapshot_save()
+            self._check_alerts(source, message.snapshot)
+        else:
+            self._source_status[source] = message.kind
+            if source not in self._snapshots:
+                self._render_source(source)
+
+        if self._source_status[source] != previous_status:
+            level = logging.INFO if message.kind == "snapshot" else logging.WARNING
+            LOG.log(
+                level,
+                "%s status %s -> %s%s",
+                source,
+                previous_status,
+                self._source_status[source],
+                f": {message.detail}" if message.detail else "",
+            )
+        self._render_status()
+
+    def _seed_alerts_from_cache(self) -> None:
+        """Record the cached levels without announcing them.
+
+        Otherwise every restart would re-toast a limit the user was already
+        told about before the HUD went down.
+        """
+
+        for source, snapshot in self._snapshots.items():
+            for key, window in (
+                (f"{source}:five_hour", snapshot.five_hour),
+                (f"{source}:weekly", snapshot.weekly),
+            ):
+                if window is None:
+                    continue
+                self.alert_tracker.evaluate(
+                    key,
+                    "",
+                    window.used_percent,
+                    window.resets_at,
+                )
+
+    def _check_alerts(self, source: str, snapshot: UsageSnapshot) -> None:
+        if not self.alerts_enabled:
+            return
+        labels = default_snapshot_labels(source)
+        candidates = (
+            (f"{source}:five_hour", snapshot.five_hour_label or labels[0], snapshot.five_hour),
+            (f"{source}:weekly", snapshot.weekly_label or labels[1], snapshot.weekly),
+        )
+        for key, label, window in candidates:
+            if window is None:
+                continue
+            event = self.alert_tracker.evaluate(
+                key,
+                label,
+                window.used_percent,
+                window.resets_at,
+            )
+            if event is not None:
+                self._fire_alert(event, window)
+
+    def _fire_alert(self, event: AlertEvent, window: RateWindow) -> None:
+        LOG.warning(
+            "alert %s %s used=%.1f%% resets_at=%s",
+            event.level_name,
+            event.key,
+            event.used_percent,
+            event.resets_at,
+        )
+        critical = event.level >= 2
+        self._flash_border(RED if critical else AMBER)
+
+        title, body = describe_alert(event, format_compact_reset_time(window.resets_at))
+        if self.notifier.notify(self._handle(), title, body, critical=critical):
+            if self._notify_after_id is not None:
+                try:
+                    self.root.after_cancel(self._notify_after_id)
+                except tk.TclError:
+                    pass
+            # Drop the tray icon once the toast has had time to show, so the
+            # HUD does not leave a permanent icon behind.
+            self._notify_after_id = self.root.after(
+                ALERT_NOTIFY_LINGER_MS,
+                self._close_notifier,
+            )
+        else:
+            LOG.warning("alert notification could not be shown")
+
+    def _close_notifier(self) -> None:
+        self._notify_after_id = None
+        self.notifier.close()
+
+    def _flash_border(self, color: str, remaining: int = ALERT_FLASH_STEPS) -> None:
+        if self._closed:
+            return
+        value = color if remaining % 2 == 1 else BORDER
+        for panel in (self.detail_panel, self.compact_panel):
+            try:
+                panel.configure(highlightbackground=value)
+            except tk.TclError:
+                pass
+        try:
+            self.root.configure(bg=value)
+        except tk.TclError:
+            pass
+
+        if remaining > 0:
+            self._flash_after_id = self.root.after(
+                ALERT_FLASH_MS,
+                self._flash_border,
+                color,
+                remaining - 1,
+            )
+        else:
+            self._flash_after_id = None
+
+    def _schedule_snapshot_save(self) -> None:
+        """Write the cache off the redraw path, at most once per idle tick."""
+
+        if not self._persist_snapshot or self._closed:
+            return
+        if self._save_after_id is not None:
+            return
+        self._save_after_id = self.root.after_idle(self._save_snapshots)
+
+    def _save_snapshots(self) -> None:
+        self._save_after_id = None
+        if self._closed:
+            return
+        self.snapshot_store.save(self._snapshots)
+
+    def _render_all(self) -> None:
+        for source in SOURCES:
+            self._render_source(source)
+
+    def _render_source(self, source: str) -> None:
+        snapshot = self._snapshots.get(source)
+        if source == SOURCE_CODEX:
+            labels = default_snapshot_labels(SOURCE_CODEX)
+            weekly_label = snapshot.weekly_label if snapshot else labels[1]
+            self.weekly_row.set_title(weekly_label)
+            self.compact_weekly.set_prefix(weekly_label)
+            weekly = snapshot.weekly if snapshot else None
+            self.weekly_row.set_window(weekly)
+            self.compact_weekly.set_window(weekly)
             return
 
-        self.weekly_row.set_window(None)
-        self.compact_weekly.set_window(None)
-        if message.kind == "reconnecting":
-            self.status_label.configure(text="RECONNECTING", fg=AMBER)
-            self.compact_status.configure(fg=AMBER)
-        elif message.kind == "unavailable":
-            self.status_label.configure(text="NO MATCH", fg=RED)
-            self.compact_status.configure(fg=RED)
-        else:
-            self.status_label.configure(text="ERROR", fg=RED)
-            self.compact_status.configure(fg=RED)
+        labels = default_snapshot_labels(SOURCE_CLAUDE)
+        five_hour_label = snapshot.five_hour_label if snapshot else labels[0]
+        weekly_label = snapshot.weekly_label if snapshot else labels[1]
+        five_hour = snapshot.five_hour if snapshot else None
+        weekly = snapshot.weekly if snapshot else None
+
+        self.claude_five_hour_row.set_title(five_hour_label)
+        self.claude_weekly_row.set_title(weekly_label)
+        self.compact_claude_five_hour.set_prefix(five_hour_label)
+        self.compact_claude_weekly.set_prefix(weekly_label)
+        self.claude_five_hour_row.set_window(five_hour)
+        self.claude_weekly_row.set_window(weekly)
+        self.compact_claude_five_hour.set_window(five_hour)
+        self.compact_claude_weekly.set_window(weekly)
+
+    def _source_indicator(self, source: str) -> tuple[str, str, int]:
+        """Return ``(text, colour, severity)`` for one source."""
+
+        kind = self._source_status.get(source, "pending")
+        has_data = source in self._snapshots
+        if kind == "live":
+            return "LIVE", GREEN, 0
+        if kind == "cached":
+            return "CACHED", AMBER, 1
+        if kind == "pending":
+            return "CONNECTING", AMBER, 1
+        if kind == "reconnecting":
+            return ("OFFLINE" if has_data else "RECONNECTING", AMBER, 1 if has_data else 2)
+        if kind == "unavailable":
+            return ("STALE" if has_data else "NO MATCH", AMBER if has_data else RED,
+                    1 if has_data else 3)
+        return ("STALE" if has_data else "ERROR", AMBER if has_data else RED,
+                1 if has_data else 3)
+
+    def _render_status(self) -> None:
+        worst_text = "LIVE"
+        worst_color = GREEN
+        worst_severity = -1
+        for source in SOURCES:
+            text, color, severity = self._source_indicator(source)
+            if severity > worst_severity:
+                worst_text, worst_color, worst_severity = text, color, severity
+
+        _configure_once(
+            self.status_label,
+            self._status_cache,
+            text=worst_text,
+            fg=worst_color,
+        )
+        _configure_once(self.compact_status, self._compact_status_cache, fg=worst_color)
 
     def close(self) -> None:
         if self._closed:
             return
         self._save_window_state()
+        if self._persist_snapshot:
+            self._save_snapshots()
         self._closed = True
         self.poller.stop()
-        if self._after_id is not None:
-            try:
-                self.root.after_cancel(self._after_id)
-            except tk.TclError:
-                pass
-        if self._topmost_after_id is not None:
-            try:
-                self.root.after_cancel(self._topmost_after_id)
-            except tk.TclError:
-                pass
+        self.claude_poller.stop()
+        for after_id in (
+            self._after_id,
+            self._topmost_after_id,
+            self._display_after_id,
+            self._save_after_id,
+            self._flash_after_id,
+            self._notify_after_id,
+        ):
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+        self.notifier.close()
+        LOG.info("HUD closed at %s", self._position)
         self.root.destroy()
 
     def shutdown(self) -> None:
         self.poller.stop()
+        self.claude_poller.stop()
         self.client.shutdown()
-        if self.poller.is_alive():
-            self.poller.join(timeout=5.0)
+        self.claude_client.shutdown()
+        for poller in (self.poller, self.claude_poller):
+            if poller.is_alive():
+                poller.join(timeout=5.0)
 
 
 def main() -> None:
     instance = _acquire_single_instance()
     if instance is None:
         return
+    setup_logging()
+    scale = enable_dpi_awareness()
+    LOG.info("starting widget (pid=%d, ui scale=%.2f)", os.getpid(), scale)
     widget: Optional[CodexUsageWidget] = None
     try:
         root = tk.Tk()
         widget = CodexUsageWidget(root)
         root.mainloop()
+    except BaseException:
+        LOG.exception("widget terminated by an unhandled error")
+        raise
     finally:
         if widget is not None:
             widget.shutdown()
         instance.release()
+        LOG.info("widget stopped")
 
 
 if __name__ == "__main__":

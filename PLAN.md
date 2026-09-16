@@ -79,6 +79,14 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Keep the 114x32 compact size but extend its lower reset row beneath the top-only controls.
 - Render the full compact reset as `R M/D(요일) HH:MM`; detail mode continues to show the full local timestamp.
 
+## Requirement Delta (2026-09-04, resilient local installation)
+
+- Keep the last successfully selected weekly value visible during network or app-server outages, with an amber cached/offline status, and replace it only after a fresh successful read.
+- Persist only the selected weekly percentage and reset timestamp under `%LOCALAPPDATA%\CodexUsageWidget\last_snapshot.json`; never persist account IDs, credentials, or raw app-server responses.
+- Start a hidden current-user supervisor at login so closing or crashing the widget restarts it within a few seconds without elevation.
+- Preserve the existing single-instance mutex, reconnect loop, taskbar overlay behavior, and explicit current-user Startup shortcut removal path.
+- Done when a cached value survives a simulated disconnect, the installed EXE reaches LIVE, terminating it causes an automatic restart, and the Startup shortcut resolves to the hidden supervisor in the stable Local AppData install directory.
+
 ## Key Decisions
 
 - Prefer the backward-compatible `rateLimits` view for the default Codex weekly value, falling back only to an unambiguous `limitId=codex` entry. Ignore every model-specific and 300-minute meter.
@@ -132,6 +140,8 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - [x] Explorer taskbar z-order recovery implemented and live regression-tested.
 - [x] Default weekly-only source selection implemented; all model-specific 5-hour groups are ignored.
 - [x] Final week-only 114px compact layout, weather adjacency, and Korean reset weekday implemented and live-verified.
+- [x] Last-good weekly snapshot persistence and cached/offline rendering implemented and tested.
+- [x] Stable Local AppData install, hidden single-instance supervisor, and close/crash restart verified.
 
 ## Verification
 
@@ -153,3 +163,57 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Passed: reproduced the real failure with a live process reported visible at `166,1040` but fully covered by `Shell_TrayWnd`; `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)` restored it immediately.
 - Passed: final EXE resolves its actual top-level `Codex Usage` HWND every 500ms; after the taskbar was deliberately raised it remained visible and left the foreground window unchanged.
 - Not run: a disruptive Windows reboot/sign-out; the actual Startup shortcut execution path was tested directly instead.
+- Passed: resilient-install suite -> `26 tests` with cached-value persistence and reconnect display coverage.
+- Passed: `build_exe.ps1` selected Python 3.11.9 and PyInstaller 6.21.0 after Python 3.14/Tk 9 proved incompatible with the packaged runtime.
+- Passed: final per-user install -> `%LOCALAPPDATA%\Programs\CodexUsageWidget\CodexUsageWidget.exe`, SHA256 `4AEE5401199B892400FF016BB615DB4738E22E6ACDC23F925C91BC92ACC88B6E`.
+- Passed: live final install -> exactly one visible responsive `Codex Usage` window, one hidden supervisor, one widget-owned `codex app-server`, and a fresh non-credential weekly cache.
+- Passed: force-killing both PyInstaller widget processes -> a new visible window and owned app-server appeared in 5.45 seconds; launching the Startup shortcut again still left exactly one supervisor and one visible widget.
+- Passed: killing only the widget-owned app-server -> a replacement app-server appeared and the last-good cache remained present.
+- Fixed after installed-runtime feedback: scheduled-task launches did not inherit the Codex Desktop versioned bin directory, causing the packaged `resolve_codex_command` startup exception.
+- Passed: Codex Desktop fallback discovery -> `codex-cli 0.153.1` resolved from `%LOCALAPPDATA%\OpenAI\Codex\bin\1e3e57cdf0634c02\codex.exe` even with a minimal scheduled-task PATH.
+- Passed: default Codex command resolution is now lazy, so a temporarily missing CLI cannot prevent the cached HUD from opening and retrying.
+- Passed: Windows scheduled task `Codex Usage Widget Supervisor` reached Running with one normal `Codex Usage` window, zero PyInstaller error windows, and one owned live app-server.
+- Passed: force-killing the scheduled widget runtime -> normal window and live app-server recovered in 6.61 seconds while the scheduled task stayed Running.
+- Corrected after destructive supervisor test: Task Scheduler did not apply `RestartOnFailure` to an externally terminated long-running action, so the task now also has a one-minute repeated trigger; `IgnoreNew` plus the supervisor mutex prevents duplicates while providing independent recovery.
+- Passed: after adding the daily one-minute repetition pattern, force-killing the scheduled supervisor produced a new supervisor PID in 37.12 seconds while the normal widget window remained visible.
+- Replaced the persistent PowerShell supervisor with a PyInstaller `--windowed` `CodexUsageSupervisor.exe`, eliminating recurring CMD/PowerShell windows while preserving login start, one-minute health checks, mutex deduplication, and widget restart.
+- Passed: windowless supervisor install -> scheduled task and Startup shortcut both target `CodexUsageSupervisor.exe`; zero legacy PowerShell watchdog processes and zero visible console windows.
+- Passed: force-killing the final widget runtime -> a normal window returned in 1.82 seconds with zero error windows and zero visible console windows.
+
+## Requirement Delta (2026-09-16, Claude usage and HUD stability)
+
+- Show Claude subscription usage next to the Codex weekly meter: both the 5-hour window and the weekly window, with reset times visible in compact mode as well.
+- Data source: the official `claude` CLI, `get_usage` control request over `--input-format stream-json` with `skip_behaviors: true`. No credential file is read; the CLI owns authentication, exactly as `codex app-server` does on the Codex side.
+- One process per poll rather than a resident CLI: the binary is ~230 MB, and a resident idle session would hold that memory for the whole uptime of the HUD. A poll costs about two seconds, so the Claude poller runs at 90 seconds while Codex stays at 30.
+- Each source polls on its own thread and tags its `UiMessage` with a source; one failing CLI must never blank or freeze the other column.
+- Fix the reported visual defects at the cause, not the symptom: flicker, self-moving position, and intermittent disappearance.
+
+## Verification Delta (2026-09-16)
+
+- Passed: live `get_usage` probe -> `utilization` is a 0-100 percentage (not 0-1) and `resets_at` is an ISO 8601 string with offset, unlike the Codex Unix seconds. Both parsers are separate.
+- Passed: `python -m unittest discover` -> 38 tests on Python 3.14.7 and on the deployed Python 3.11.9.
+- Passed: live end-to-end read through the widget parser -> 5-hour and weekly windows in 1.9 seconds.
+- Passed: deployed to `%LOCALAPPDATA%\Programs\CodexUsageWidget`, killed the running widget, supervisor restarted it, and a taskbar screenshot showed all three columns with reset lines and correct threshold colours (`CX 주 4%` red, both Claude columns green).
+- Compact width settled at 308 px: the free taskbar strip between the weather widget and the centred task buttons is about 330 px on this machine, and the buttons slide as apps open, so the gap check moved to a deterministic unit test with a stubbed taskbar layout.
+- Passed: detail panel screenshot -> three rows with progress bars at 280x186.
+- Cause found for self-moving position: the process never declared DPI awareness, so Tk coordinates were DPI-virtualised while every `user32` rect (taskbar, monitors) was physical. `enable_dpi_awareness()` now runs before `tk.Tk()`, layout constants are scaled through `_s()`, and an auto-hidden taskbar is detected with `ABM_GETSTATE` instead of being anchored to its off-screen rect.
+- Cause found for disappearance, part 1: `_refresh_topmost` returned without rescheduling on a single `TclError`, permanently killing the loop. It now reschedules in a `finally`.
+- Cause found for disappearance, part 2 (the real one, reproduced live): `Shell_TrayWnd` is topmost too, so after it redraws it can sit above the HUD inside the same band while `WS_EX_TOPMOST` is still set. `SetWindowPos(HWND_TOPMOST)` alone does not move an already-topmost window, so `SWP_SHOWWINDOW` is required to re-insert it; the old build got away with firing that blindly twice a second. The loop now asks `WindowFromPoint` at the centre of the HUD whether we still own our own pixels, and only then issues the repainting raise.
+- Cause found for disappearance, part 3: the HWND must be Tk's `wm frame`. `winfo_id()` is the inner Tk window and `GetAncestor(GA_ROOT)` returns it unchanged rather than the `TkTopLevel` wrapper, so raising it moved nothing. It is also resolved fresh each tick: before the first map, `wm frame` still reports the inner window, and caching that value pins the HUD to a window that owns no z-order.
+- Passed: burying the live HUD by raising `Shell_TrayWnd` to `HWND_TOPMOST` -> it lost its own centre pixel and recovered in 405 ms. Before the handle fix, the same test never recovered within 10 s.
+- Cause found for flicker: `set_prefix` wrote `"Week —"` before `set_window` wrote the value, and the 500 ms topmost timer called `update_idletasks()` with `SWP_SHOWWINDOW` on a layered window. Label writes are now diffed against the last value, the 500 ms timer now only re-inserts z-order when the HUD is really covered, and the snapshot cache is written from `after_idle` instead of the redraw path.
+
+## Requirement Delta (2026-09-16, alerts and logging)
+
+- Alert once when a limit crosses 80% used, and again at 90%, without repeating on every poll. A quota window is identified by its `resets_at`, so a rollover re-arms both thresholds; usage dropping back under a threshold re-arms that threshold too.
+- A restart must not re-announce a level the user was already told about, so the tracker is seeded from `last_snapshot.json` without firing.
+- Notification path is `Shell_NotifyIcon` with `NIF_INFO`: Windows 10/11 render it as a normal toast and it needs no registered AppUserModelID, unlike the WinRT toast API. The tray icon is added only to carry the notification and removed 12 seconds later, so the HUD leaves nothing in the tray.
+- Rotating `widget.log` (256 KB x 3) next to the other state files. Until now every Win32 failure was swallowed silently, which is why the z-order bug could only be found by reproducing it by hand.
+
+## Verification Delta (2026-09-16, alerts and logging)
+
+- Passed: `python -m unittest discover` -> 50 tests on Python 3.14.7 and on the deployed Python 3.11.9.
+- Passed: live alert -> a 93% weekly reading produced the toast "CX 주 한도 임박 / 93% 사용 · 남은 7% · R 9/19(토)18:34" and a red border flash on the HUD, both captured in screenshots.
+- Passed: deployed install log -> startup, `HUD ready` with mode/position/scale/cached sources, and both `cached -> live` transitions written to `%LOCALAPPDATA%\CodexUsageWidget\widget.log`.
+- Passed: restart with Codex already at 96% used produced no toast, confirming the cache seeding.
+- Known cosmetic limit: the toast header shows the host process name ("Python"). Changing it needs a Start Menu shortcut carrying an AppUserModelID; not done, because a mismatched AUMID can suppress the notification entirely.
