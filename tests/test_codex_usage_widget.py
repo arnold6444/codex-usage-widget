@@ -1,3 +1,5 @@
+import logging
+import logging.handlers
 import os
 import queue
 import sys
@@ -7,11 +9,23 @@ import tkinter as tk
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
+from claude_usage_client import (
+    ClaudeConnectionError,
+    parse_iso_timestamp,
+    parse_limit_window,
+)
+from usage_alerts import AlertTracker, describe_alert
 from codex_usage_widget import (
+    BORDER,
     COMPACT_HEIGHT,
     COMPACT_RESET_TEXT,
     COMPACT_WIDTH,
+    LOG,
+    RED,
+    WINDOW_HEIGHT,
+    WINDOW_WIDTH,
     CodexAppServerClient,
     CodexConnectionError,
     CodexUsageWidget,
@@ -19,14 +33,20 @@ from codex_usage_widget import (
     UiMessage,
     UsagePoller,
     UsageSnapshot,
+    UsageSnapshotStore,
     WindowState,
     WindowStateStore,
+    _TaskbarLayout,
     _acquire_single_instance,
+    _compact_initial_position,
     _fit_position_to_monitors,
     _taskbar_layout,
     format_compact_reset_time,
     format_percent,
     format_reset_time,
+    resolve_codex_command,
+    setup_logging,
+    select_claude_windows,
     select_usage_windows,
 )
 
@@ -206,7 +226,7 @@ class SelectionTests(unittest.TestCase):
         later = datetime(2027, 1, 22, 20, 30, tzinfo=local_tz).timestamp()
         self.assertEqual(
             format_compact_reset_time(later, now=now, local_tz=local_tz),
-            "R 1/22(금) 20:30",
+            "R 1/22(금)20:30",
         )
 
 
@@ -281,6 +301,40 @@ class ClientTests(unittest.TestCase):
         finally:
             client.shutdown()
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows Codex discovery test")
+    def test_resolves_codex_desktop_install_when_scheduled_path_is_minimal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            codex_path = (
+                Path(directory)
+                / "OpenAI"
+                / "Codex"
+                / "bin"
+                / "current"
+                / "codex.exe"
+            )
+            codex_path.parent.mkdir(parents=True)
+            codex_path.touch()
+
+            with mock.patch("codex_usage_widget.shutil.which", return_value=None):
+                with mock.patch.dict(
+                    os.environ,
+                    {"LOCALAPPDATA": directory},
+                    clear=False,
+                ):
+                    self.assertEqual(resolve_codex_command(), (str(codex_path),))
+
+    def test_default_codex_resolution_is_lazy(self):
+        client = CodexAppServerClient(request_timeout=0.1)
+        try:
+            with mock.patch(
+                "codex_usage_widget.resolve_codex_command",
+                side_effect=CodexConnectionError("missing"),
+            ):
+                with self.assertRaisesRegex(CodexConnectionError, "missing"):
+                    client.read_rate_limits()
+        finally:
+            client.shutdown()
+
 
 class _FlakyClient:
     def __init__(self):
@@ -323,7 +377,121 @@ class _WeeklyOnlyClient:
         self.shutdown_called = True
 
 
+STUB_CLAUDE_PAYLOAD = {
+    "rate_limits_available": True,
+    "rate_limits": {
+        "five_hour": {"utilization": 8, "resets_at": None},
+        "seven_day": {"utilization": 3, "resets_at": None},
+    },
+}
+
+
+class _StubClaudeClient:
+    """Stand-in so no test ever spawns the real ``claude`` binary."""
+
+    is_disconnected = False
+
+    def __init__(self, payload=STUB_CLAUDE_PAYLOAD, *, fail=False):
+        self.payload = payload
+        self.fail = fail
+        self.shutdown_called = False
+
+    def read_rate_limits(self):
+        if self.fail:
+            raise ClaudeConnectionError("stub")
+        return self.payload
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
+class ClaudeSelectionTests(unittest.TestCase):
+    def test_both_account_windows_are_selected_and_model_scoped_ignored(self):
+        snapshot = select_claude_windows(
+            {
+                "rate_limits_available": True,
+                "rate_limits": {
+                    "five_hour": {
+                        "utilization": 8,
+                        "resets_at": "2026-09-16T06:30:00.154466+00:00",
+                    },
+                    "seven_day": {
+                        "utilization": 3,
+                        "resets_at": "2026-09-20T13:00:00+00:00",
+                    },
+                    "seven_day_opus": None,
+                    "model_scoped": [{"display_name": "Fable", "utilization": 99}],
+                },
+            }
+        )
+
+        self.assertTrue(snapshot.complete)
+        self.assertEqual(snapshot.five_hour.used_percent, 8)
+        self.assertEqual(snapshot.five_hour.window_duration_mins, 300)
+        self.assertEqual(snapshot.weekly.used_percent, 3)
+        self.assertEqual(snapshot.weekly.window_duration_mins, 10_080)
+        self.assertEqual(
+            snapshot.five_hour.resets_at,
+            datetime(2026, 9, 16, 6, 30, 0, 154466, tzinfo=timezone.utc).timestamp(),
+        )
+
+    def test_missing_or_reshaped_fields_never_raise(self):
+        self.assertFalse(select_claude_windows({}).available)
+        self.assertFalse(select_claude_windows({"rate_limits": None}).available)
+        self.assertFalse(
+            select_claude_windows({"rate_limits": {"five_hour": {}}}).available
+        )
+
+        partial = select_claude_windows(
+            {"rate_limits": {"five_hour": {"utilization": 12, "resets_at": None}}}
+        )
+        self.assertTrue(partial.available)
+        self.assertFalse(partial.complete)
+        self.assertIsNone(partial.five_hour.resets_at)
+
+    def test_iso_timestamps_and_utilization_bounds(self):
+        self.assertIsNone(parse_iso_timestamp("nonsense"))
+        self.assertIsNone(parse_iso_timestamp(None))
+        self.assertEqual(
+            parse_iso_timestamp("2026-09-20T13:00:00Z"),
+            datetime(2026, 9, 20, 13, 0, tzinfo=timezone.utc).timestamp(),
+        )
+        self.assertEqual(parse_limit_window({"utilization": 140})[0], 100)
+        self.assertEqual(parse_limit_window({"utilization": -3})[0], 0)
+        self.assertIsNone(parse_limit_window({"utilization": "nope"}))
+
+
 class PollerTests(unittest.TestCase):
+    def test_claude_poller_labels_its_messages_with_its_source(self):
+        client = _StubClaudeClient(
+            {
+                "rate_limits": {
+                    "five_hour": {"utilization": 8, "resets_at": None},
+                    "seven_day": {"utilization": 3, "resets_at": None},
+                }
+            }
+        )
+        messages = queue.Queue()
+        poller = UsagePoller(
+            client,
+            messages,
+            source="claude",
+            parse=select_claude_windows,
+            connection_errors=(ClaudeConnectionError, OSError),
+            refresh_seconds=60,
+        )
+        poller.start()
+        try:
+            message = messages.get(timeout=2)
+            self.assertEqual(message.source, "claude")
+            self.assertEqual(message.kind, "snapshot")
+            self.assertEqual(message.snapshot.five_hour.remaining_percent, 92)
+            self.assertEqual(message.snapshot.weekly.remaining_percent, 97)
+        finally:
+            poller.stop()
+            poller.join(timeout=2)
+        self.assertTrue(client.shutdown_called)
+
     def test_weekly_only_default_meter_is_still_a_live_snapshot(self):
         client = _WeeklyOnlyClient()
         messages = queue.Queue()
@@ -459,6 +627,367 @@ class WindowStateStoreTests(unittest.TestCase):
         replacement.release()
 
 
+class UsageSnapshotStoreTests(unittest.TestCase):
+    def test_round_trip_keeps_both_sources_and_no_account_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state" / "last_snapshot.json"
+            store = UsageSnapshotStore(path)
+            codex = UsageSnapshot(
+                five_hour=None,
+                weekly=RateWindow(41, 10_080, 1_800_100_000),
+                limit_id="codex",
+                five_hour_label="CX 5h",
+                weekly_label="CX 주",
+                weekly_limit_id="codex",
+            )
+            claude = UsageSnapshot(
+                five_hour=RateWindow(8, 300, 1_800_050_000),
+                weekly=RateWindow(3, 10_080, 1_800_100_000),
+                limit_id="claude",
+                five_hour_label="CL 5h",
+                weekly_label="CL 주",
+                five_hour_limit_id="claude",
+                weekly_limit_id="claude",
+            )
+
+            self.assertTrue(store.save({"codex": codex, "claude": claude}))
+            self.assertEqual(store.load(), {"codex": codex, "claude": claude})
+            raw = path.read_text(encoding="utf-8")
+            self.assertNotIn("account", raw.lower())
+            self.assertNotIn("token", raw.lower())
+
+    def test_invalid_or_stale_version_cache_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "last_snapshot.json"
+            store = UsageSnapshotStore(path)
+
+            path.write_text("not-json", encoding="utf-8")
+            self.assertEqual(store.load(), {})
+
+            path.write_text(
+                '{"version":1,"weekly":{"usedPercent":2,"windowDurationMins":10080}}',
+                encoding="utf-8",
+            )
+            self.assertEqual(store.load(), {})
+
+            path.write_text(
+                '{"version":3,"sources":{"codex":{"limitId":"codex",'
+                '"weekly":{"usedPercent":2,"windowDurationMins":300}}}}',
+                encoding="utf-8",
+            )
+            self.assertEqual(store.load(), {})
+
+
+class CompactPlacementTests(unittest.TestCase):
+    """Deterministic taskbar maths, independent of the live taskbar."""
+
+    class _FakeRoot:
+        @staticmethod
+        def winfo_screenwidth():
+            return 1920
+
+        @staticmethod
+        def winfo_screenheight():
+            return 1080
+
+    def test_hud_keeps_a_gap_from_the_task_buttons(self):
+        layout = _TaskbarLayout(
+            left=0, top=1032, right=1920, bottom=1080,
+            task_buttons_left=451, dpi=96,
+        )
+        with mock.patch("codex_usage_widget._taskbar_layout", return_value=layout):
+            x, y = _compact_initial_position(self._FakeRoot())
+
+        self.assertLessEqual(x + COMPACT_WIDTH + 12, layout.task_buttons_left)
+        self.assertEqual(y, 1032 + (48 - COMPACT_HEIGHT) // 2)
+
+    def test_autohidden_taskbar_falls_back_to_the_work_area(self):
+        with mock.patch("codex_usage_widget._taskbar_layout", return_value=None):
+            x, y = _compact_initial_position(self._FakeRoot())
+
+        self.assertGreaterEqual(x, 0)
+        self.assertLess(x + COMPACT_WIDTH, 1920)
+        self.assertLess(y + COMPACT_HEIGHT, 1080)
+
+
+class AlertTrackerTests(unittest.TestCase):
+    def test_each_threshold_fires_once_per_quota_window(self):
+        tracker = AlertTracker()
+        reset = 1_800_000_000.0
+
+        self.assertIsNone(tracker.evaluate("codex:weekly", "CX 주", 70, reset))
+
+        warn = tracker.evaluate("codex:weekly", "CX 주", 81, reset)
+        self.assertIsNotNone(warn)
+        self.assertEqual(warn.level_name, "WARN")
+        self.assertIsNone(tracker.evaluate("codex:weekly", "CX 주", 85, reset))
+
+        critical = tracker.evaluate("codex:weekly", "CX 주", 91, reset)
+        self.assertIsNotNone(critical)
+        self.assertEqual(critical.level_name, "CRITICAL")
+        self.assertIsNone(tracker.evaluate("codex:weekly", "CX 주", 99, reset))
+
+    def test_a_new_reset_time_re_arms_the_thresholds(self):
+        tracker = AlertTracker()
+        self.assertIsNotNone(tracker.evaluate("cl:5h", "CL 5h", 95, 100.0))
+        self.assertIsNone(tracker.evaluate("cl:5h", "CL 5h", 95, 100.0))
+
+        # Window rolled over: the same usage is news again.
+        event = tracker.evaluate("cl:5h", "CL 5h", 95, 200.0)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.level_name, "CRITICAL")
+
+    def test_dropping_below_a_threshold_re_arms_it_within_the_same_window(self):
+        tracker = AlertTracker()
+        self.assertIsNotNone(tracker.evaluate("cl:5h", "CL 5h", 82, 100.0))
+        self.assertIsNone(tracker.evaluate("cl:5h", "CL 5h", 40, 100.0))
+        self.assertIsNotNone(tracker.evaluate("cl:5h", "CL 5h", 82, 100.0))
+
+    def test_sources_and_windows_are_tracked_independently(self):
+        tracker = AlertTracker()
+        self.assertIsNotNone(tracker.evaluate("codex:weekly", "CX 주", 95, 1.0))
+        self.assertIsNotNone(tracker.evaluate("claude:weekly", "CL 주", 95, 1.0))
+
+    def test_missing_or_nonsense_usage_never_alerts(self):
+        tracker = AlertTracker()
+        self.assertIsNone(tracker.evaluate("k", "l", None, 1.0))
+        self.assertIsNone(tracker.evaluate("k", "l", float("nan"), 1.0))
+
+    def test_alert_text_reports_used_and_remaining(self):
+        tracker = AlertTracker()
+        event = tracker.evaluate("codex:weekly", "CX 주", 92.0, None)
+        title, body = describe_alert(event, "R 9/19(토)18:34")
+
+        self.assertIn("CX 주", title)
+        self.assertIn("92%", body)
+        self.assertIn("8%", body)
+        self.assertIn("R 9/19(토)18:34", body)
+
+
+class LoggingTests(unittest.TestCase):
+    def test_rotating_log_is_created_and_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "widget.log"
+            try:
+                self.assertEqual(setup_logging(path), path)
+                LOG.info("hello %s", "world")
+                for handler in LOG.handlers:
+                    handler.flush()
+                self.assertIn("hello world", path.read_text(encoding="utf-8"))
+            finally:
+                for handler in list(LOG.handlers):
+                    if isinstance(handler, logging.handlers.RotatingFileHandler):
+                        LOG.removeHandler(handler)
+                        handler.close()
+
+    def test_an_unwritable_log_path_is_not_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            self.assertIsNone(setup_logging(blocker / "nested" / "widget.log"))
+
+
+class _RecordingNotifier:
+    def __init__(self, succeed=True):
+        self.calls = []
+        self.closed = 0
+        self.succeed = succeed
+
+    def notify(self, handle, title, message, *, critical):
+        self.calls.append((title, message, critical))
+        return self.succeed
+
+    def close(self):
+        self.closed += 1
+
+
+class AlertIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
+    def test_crossing_a_threshold_notifies_and_flashes_once(self):
+        notifier = _RecordingNotifier()
+        root = tk.Tk()
+        root.withdraw()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+            notifier=notifier,
+        )
+        hot = select_usage_windows(
+            {"rateLimits": {"limitId": "codex", "primary": window(93, 10_080)}}
+        )
+        try:
+            widget._apply_message(UiMessage("snapshot", snapshot=hot))
+            root.update_idletasks()
+
+            self.assertEqual(len(notifier.calls), 1)
+            title, body, critical = notifier.calls[0]
+            self.assertTrue(critical)
+            self.assertIn("CX 주", title)
+            self.assertIn("93%", body)
+            self.assertIsNotNone(widget._flash_after_id)
+
+            # The same reading must not keep re-announcing itself.
+            widget._apply_message(UiMessage("snapshot", snapshot=hot))
+            self.assertEqual(len(notifier.calls), 1)
+        finally:
+            widget.close()
+            widget.shutdown()
+
+        self.assertGreaterEqual(notifier.closed, 1)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
+    def test_flashing_restores_the_normal_border(self):
+        root = tk.Tk()
+        root.withdraw()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+            notifier=_RecordingNotifier(),
+        )
+        try:
+            widget._flash_border(RED, remaining=1)
+            self.assertEqual(
+                widget.compact_panel.cget("highlightbackground"), RED
+            )
+            widget._flash_border(RED, remaining=0)
+            self.assertEqual(
+                widget.compact_panel.cget("highlightbackground"), BORDER
+            )
+            self.assertIsNone(widget._flash_after_id)
+        finally:
+            widget.close()
+            widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
+    def test_a_restart_does_not_re_announce_the_cached_level(self):
+        notifier = _RecordingNotifier()
+        with tempfile.TemporaryDirectory() as directory:
+            store = UsageSnapshotStore(Path(directory) / "last_snapshot.json")
+            hot = select_usage_windows(
+                {"rateLimits": {"limitId": "codex", "primary": window(93, 10_080)}}
+            )
+            self.assertTrue(store.save({"codex": hot}))
+
+            root = tk.Tk()
+            root.withdraw()
+            widget = CodexUsageWidget(
+                root,
+                client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
+                autostart=False,
+                persist_state=False,
+                snapshot_store=store,
+                persist_snapshot=True,
+                notifier=notifier,
+            )
+            try:
+                widget._apply_message(UiMessage("snapshot", snapshot=hot))
+                self.assertEqual(notifier.calls, [])
+
+                # Getting worse is still worth a shout only if it crosses a
+                # threshold that has not been announced yet.
+                warmer = select_usage_windows(
+                    {
+                        "rateLimits": {
+                            "limitId": "codex",
+                            "primary": window(96, 10_080),
+                        }
+                    }
+                )
+                widget._apply_message(UiMessage("snapshot", snapshot=warmer))
+                self.assertEqual(notifier.calls, [])
+            finally:
+                widget.close()
+                widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD alert test")
+    def test_alerts_can_be_switched_off(self):
+        notifier = _RecordingNotifier()
+        root = tk.Tk()
+        root.withdraw()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+            notifier=notifier,
+            alerts_enabled=False,
+        )
+        try:
+            widget._apply_message(
+                UiMessage(
+                    "snapshot",
+                    snapshot=select_usage_windows(
+                        {"rateLimits": {"limitId": "codex", "primary": window(99, 10_080)}}
+                    ),
+                )
+            )
+            self.assertEqual(notifier.calls, [])
+        finally:
+            widget.close()
+            widget.shutdown()
+
+
+class TopmostHandleTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows HWND resolution")
+    def test_handle_is_the_visible_toplevel_not_the_inner_tk_window(self):
+        """The z-order fix is worthless if we raise the wrong window.
+
+        ``winfo_id`` is the inner Tk window and ``GetAncestor(GA_ROOT)`` returns
+        it unchanged, so only the ``TkTopLevel`` wrapper may be used.
+        """
+
+        import ctypes
+        from ctypes import wintypes
+
+        root = tk.Tk()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+        )
+        try:
+            root.update()
+            handle = widget._handle()
+
+            user32 = ctypes.windll.user32
+            enum_proc = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+            )
+            visible_toplevels = []
+
+            def collect(hwnd, _lparam):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(
+                    ctypes.c_void_p(hwnd), ctypes.byref(pid)
+                )
+                if pid.value == os.getpid() and user32.IsWindowVisible(
+                    ctypes.c_void_p(hwnd)
+                ):
+                    name = ctypes.create_unicode_buffer(64)
+                    user32.GetClassNameW(ctypes.c_void_p(hwnd), name, 64)
+                    if name.value == "TkTopLevel":
+                        visible_toplevels.append(hwnd)
+                return True
+
+            user32.EnumWindows(enum_proc(collect), None)
+
+            self.assertIn(handle, visible_toplevels)
+            self.assertNotEqual(handle, root.winfo_id())
+        finally:
+            widget.close()
+            widget.shutdown()
+
+
 class WidgetSmokeTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows HUD smoke test")
     def test_window_has_requested_hud_attributes(self):
@@ -468,10 +997,12 @@ class WidgetSmokeTests(unittest.TestCase):
         widget = CodexUsageWidget(
             root,
             client=client,
+            claude_client=_StubClaudeClient(),
             autostart=False,
             persist_state=False,
         )
         try:
+            root.deiconify()
             root.update_idletasks()
             self.assertEqual(root.winfo_width(), COMPACT_WIDTH)
             self.assertEqual(root.winfo_height(), COMPACT_HEIGHT)
@@ -483,16 +1014,16 @@ class WidgetSmokeTests(unittest.TestCase):
                     root.winfo_y(),
                     layout.top + (layout.bottom - layout.top - COMPACT_HEIGHT) // 2,
                 )
-                if layout.task_buttons_left is not None:
-                    self.assertLessEqual(
-                        root.winfo_x() + COMPACT_WIDTH,
-                        layout.task_buttons_left,
-                    )
+                # The centred Win11 task buttons slide as apps open, so only the
+                # taskbar band itself is a stable assertion here; the gap maths
+                # is covered deterministically in CompactPlacementTests.
+                self.assertGreaterEqual(root.winfo_x(), layout.left)
+                self.assertLessEqual(root.winfo_x() + COMPACT_WIDTH, layout.right)
 
             widget.show_details()
             root.update_idletasks()
-            self.assertEqual(root.winfo_width(), 280)
-            self.assertEqual(root.winfo_height(), 130)
+            self.assertEqual(root.winfo_width(), WINDOW_WIDTH)
+            self.assertEqual(root.winfo_height(), WINDOW_HEIGHT)
             self.assertFalse(widget._compact_mode)
 
             widget.show_compact()
@@ -515,27 +1046,127 @@ class WidgetSmokeTests(unittest.TestCase):
         widget = CodexUsageWidget(
             root,
             client=client,
+            claude_client=_StubClaudeClient(),
             autostart=False,
             persist_state=False,
+            alerts_enabled=False,
         )
-        snapshot = UsageSnapshot(
-            five_hour=None,
-            weekly=RateWindow(27, 10_080, 1_800_100_000),
-            limit_id="codex",
-            weekly_limit_id="codex",
+        snapshot = select_usage_windows(
+            {"rateLimits": {"limitId": "codex", "primary": window(27, 10_080)}}
+        )
+        claude = select_claude_windows(
+            {
+                "rate_limits": {
+                    "five_hour": {"utilization": 8, "resets_at": None},
+                    "seven_day": {"utilization": 3, "resets_at": None},
+                }
+            }
         )
         try:
             widget._apply_message(UiMessage("snapshot", snapshot=snapshot))
             root.update_idletasks()
 
-            self.assertEqual(widget.compact_weekly.label.cget("text"), "Week 73%")
-            self.assertEqual(widget.status_label.cget("text"), "LIVE")
+            self.assertEqual(widget.compact_weekly.label.cget("text"), "CX 주 73%")
             self.assertEqual(widget.weekly_row.percent.cget("text"), "73%")
             self.assertTrue(widget.compact_weekly.reset.cget("text").startswith("R "))
             self.assertEqual(widget.compact_weekly.reset.cget("fg"), COMPACT_RESET_TEXT)
+            # Claude has not answered yet, so the shared status stays amber.
+            self.assertEqual(widget.status_label.cget("text"), "CONNECTING")
+
+            widget._apply_message(
+                UiMessage("snapshot", snapshot=claude, source="claude")
+            )
+            root.update_idletasks()
+
+            self.assertEqual(widget.status_label.cget("text"), "LIVE")
+            self.assertEqual(
+                widget.compact_claude_five_hour.label.cget("text"), "CL 5h 92%"
+            )
+            self.assertEqual(widget.compact_claude_weekly.label.cget("text"), "CL 주 97%")
+            self.assertEqual(widget.claude_five_hour_row.percent.cget("text"), "92%")
+            self.assertEqual(widget.claude_weekly_row.percent.cget("text"), "97%")
+            # A Codex update must not blank the Claude columns.
+            self.assertEqual(widget.compact_weekly.label.cget("text"), "CX 주 73%")
         finally:
             widget.close()
             widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows compact HUD test")
+    def test_repeated_identical_snapshot_does_not_rewrite_labels(self):
+        root = tk.Tk()
+        root.withdraw()
+        widget = CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+            alerts_enabled=False,
+        )
+        snapshot = select_usage_windows(
+            {"rateLimits": {"limitId": "codex", "primary": window(27, 10_080)}}
+        )
+        try:
+            widget._apply_message(UiMessage("snapshot", snapshot=snapshot))
+            root.update_idletasks()
+
+            writes = []
+            original = widget.compact_weekly.label.configure
+
+            def counting_configure(*args, **kwargs):
+                writes.append(kwargs or args)
+                return original(*args, **kwargs)
+
+            widget.compact_weekly.label.configure = counting_configure
+            for _ in range(5):
+                widget._apply_message(UiMessage("snapshot", snapshot=snapshot))
+            root.update_idletasks()
+
+            self.assertEqual(writes, [])
+            self.assertEqual(widget.compact_weekly.label.cget("text"), "CX 주 73%")
+        finally:
+            widget.close()
+            widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows cached HUD test")
+    def test_cached_snapshot_stays_visible_while_reconnecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = UsageSnapshotStore(Path(directory) / "last_snapshot.json")
+            cached = UsageSnapshot(
+                five_hour=None,
+                weekly=RateWindow(41, 10_080, 1_800_100_000),
+                limit_id="codex",
+                five_hour_label="CX 5h",
+                weekly_label="CX 주",
+                weekly_limit_id="codex",
+            )
+            self.assertTrue(store.save({"codex": cached}))
+
+            root = tk.Tk()
+            root.withdraw()
+            widget = CodexUsageWidget(
+                root,
+                client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
+                autostart=False,
+                persist_state=False,
+                snapshot_store=store,
+                persist_snapshot=True,
+            )
+            try:
+                root.update_idletasks()
+                self.assertEqual(widget.compact_weekly.label.cget("text"), "CX 주 59%")
+                self.assertEqual(widget.status_label.cget("text"), "CACHED")
+
+                widget._apply_message(UiMessage("reconnecting", detail="offline"))
+                root.update_idletasks()
+
+                self.assertEqual(widget.compact_weekly.label.cget("text"), "CX 주 59%")
+                self.assertEqual(widget.status_label.cget("text"), "OFFLINE")
+                self.assertEqual(widget.compact_status.cget("fg"), "#f0b45a")
+            finally:
+                widget.close()
+                widget.shutdown()
 
     @unittest.skipUnless(sys.platform == "win32", "Windows HUD integration test")
     def test_close_stops_active_worker_and_app_server(self):
@@ -545,6 +1176,7 @@ class WidgetSmokeTests(unittest.TestCase):
         widget = CodexUsageWidget(
             root,
             client=client,
+            claude_client=_StubClaudeClient(),
             autostart=True,
             persist_state=False,
         )
@@ -578,6 +1210,7 @@ class WidgetSmokeTests(unittest.TestCase):
             first = CodexUsageWidget(
                 first_root,
                 client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
                 autostart=False,
                 state_store=store,
             )
@@ -596,17 +1229,18 @@ class WidgetSmokeTests(unittest.TestCase):
             second = CodexUsageWidget(
                 second_root,
                 client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
                 autostart=False,
                 state_store=store,
             )
             try:
                 second_root.update_idletasks()
                 self.assertFalse(second._compact_mode)
-                self.assertEqual((second_root.winfo_x(), second_root.winfo_y()), (333, 444))
+                self.assertEqual(second._position, (333, 444))
 
                 second.show_compact()
                 second_root.update_idletasks()
-                self.assertEqual((second_root.winfo_x(), second_root.winfo_y()), (111, 222))
+                self.assertEqual(second._position, (111, 222))
             finally:
                 second.close()
                 second.shutdown()
@@ -626,6 +1260,7 @@ class WidgetSmokeTests(unittest.TestCase):
             widget = CodexUsageWidget(
                 root,
                 client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
                 autostart=False,
                 state_store=store,
             )
