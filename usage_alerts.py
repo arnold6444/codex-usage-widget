@@ -18,6 +18,11 @@ from typing import Any, Optional
 WARN_USED_PERCENT = 80.0
 CRITICAL_USED_PERCENT = 90.0
 
+# Codex reports ``resetsAt`` a second or two apart between polls, so an exact
+# comparison would read every poll as a fresh quota window and re-announce the
+# same limit forever.  Real rollovers move the reset by hours.
+CYCLE_TOLERANCE_SECONDS = 600.0
+
 LEVEL_NONE = 0
 LEVEL_WARN = 1
 LEVEL_CRITICAL = 2
@@ -51,11 +56,18 @@ class AlertTracker:
         *,
         warn_percent: float = WARN_USED_PERCENT,
         critical_percent: float = CRITICAL_USED_PERCENT,
+        cycle_tolerance: float = CYCLE_TOLERANCE_SECONDS,
     ) -> None:
         self.warn_percent = warn_percent
         self.critical_percent = critical_percent
+        self.cycle_tolerance = cycle_tolerance
         self._levels: dict[str, int] = {}
         self._cycles: dict[str, Optional[float]] = {}
+
+    def _is_new_cycle(self, previous: Optional[float], current: Optional[float]) -> bool:
+        if previous is None or current is None:
+            return previous is not current
+        return abs(current - previous) > self.cycle_tolerance
 
     def level_for(self, used_percent: float) -> int:
         if used_percent >= self.critical_percent:
@@ -74,10 +86,12 @@ class AlertTracker:
         if used_percent is None or not math.isfinite(used_percent):
             return None
 
-        if key in self._cycles and self._cycles[key] != resets_at:
+        if key in self._cycles and self._is_new_cycle(self._cycles[key], resets_at):
             # New quota window: forget what we already announced.
             self._levels[key] = LEVEL_NONE
-        self._cycles[key] = resets_at
+            self._cycles[key] = resets_at
+        elif key not in self._cycles:
+            self._cycles[key] = resets_at
 
         level = self.level_for(used_percent)
         previous = self._levels.get(key, LEVEL_NONE)

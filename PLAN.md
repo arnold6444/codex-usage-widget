@@ -222,3 +222,10 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Passed: deployed install log -> startup, `HUD ready` with mode/position/scale/cached sources, and both `cached -> live` transitions written to `%LOCALAPPDATA%\CodexUsageWidget\widget.log`.
 - Passed: restart with Codex already at 96% used produced no toast, confirming the cache seeding.
 - Known cosmetic limit: the toast header shows the host process name ("Python"). Changing it needs a Start Menu shortcut carrying an AppUserModelID; not done, because a mismatched AUMID can suppress the notification entirely.
+
+## Requirement Delta (2026-09-16, alerts off by default)
+
+- The HUD already sits in permanent view, so a separate notification is interruption rather than information: threshold alerts are now opt-in (`alerts_enabled=True`) and off by default.
+- Bug found in the field before switching them off: Codex returns `resetsAt` a second or two apart between polls (1789810463 then 1789810462), and the tracker compared it exactly, so every poll looked like a fresh quota window and re-announced the same limit every 30 seconds. Cycle comparison is now tolerant (10 minutes); a real rollover moves the reset by hours.
+- Passed: `python -m unittest discover` -> 52 tests, including one that replays the observed drift sequence.
+- Passed: deployed with alerts off; no further `alert` lines in `widget.log`.

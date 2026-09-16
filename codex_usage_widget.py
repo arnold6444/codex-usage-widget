@@ -1791,7 +1791,7 @@ class CodexUsageWidget:
         persist_snapshot: Optional[bool] = None,
         alert_tracker: Optional[AlertTracker] = None,
         notifier: Optional[TrayNotifier] = None,
-        alerts_enabled: bool = True,
+        alerts_enabled: bool = False,
     ) -> None:
         self.root = root
         self.client = client or CodexAppServerClient()
