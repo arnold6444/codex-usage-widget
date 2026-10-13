@@ -25,8 +25,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from claude_usage_client import (
+    CLAUDE_MAX_REFRESH_SECONDS,
+    CLAUDE_RATE_LIMIT_BACKOFF_SECONDS,
     CLAUDE_REFRESH_SECONDS,
     ClaudeConnectionError,
+    ClaudeRateLimitedError,
     ClaudeUnavailableError,
     ClaudeUsageClient,
     ClaudeUsageError,
@@ -46,11 +49,16 @@ REFRESH_SECONDS = 30.0
 RPC_TIMEOUT_SECONDS = 20.0
 RECONNECT_DELAYS_SECONDS = (1.0, 2.0, 4.0, 8.0, 30.0)
 TOPMOST_REFRESH_MS = 500
-DISPLAY_WATCH_MS = 30_000
+DISPLAY_WATCH_MS = 2_000
 
 SOURCE_CODEX = "codex"
 SOURCE_CLAUDE = "claude"
 SOURCES = (SOURCE_CODEX, SOURCE_CLAUDE)
+
+# How long a source may fail before its last reading is greyed out as stale.
+# Each is a few refresh intervals, so one slow poll never greys a column.
+STALE_AFTER_SECONDS = {SOURCE_CODEX: 300.0, SOURCE_CLAUDE: 900.0}
+STALE_CHECK_MS = 30_000
 
 LOG_MAX_BYTES = 256 * 1024
 LOG_BACKUP_COUNT = 2
@@ -1119,6 +1127,10 @@ class UsagePoller(threading.Thread):
             CodexConnectionError,
             OSError,
         ),
+        cooldown_errors: tuple[type[BaseException], ...] = (),
+        cooldown_delays: Sequence[float] = (),
+        max_refresh_seconds: Optional[float] = None,
+        relax_after_successes: int = 30,
         refresh_seconds: float = REFRESH_SECONDS,
         reconnect_delays: Sequence[float] = RECONNECT_DELAYS_SECONDS,
     ) -> None:
@@ -1130,6 +1142,11 @@ class UsagePoller(threading.Thread):
         self.unavailable_detail = unavailable_detail
         self.rpc_errors = rpc_errors
         self.connection_errors = connection_errors
+        self.cooldown_errors = cooldown_errors
+        self.cooldown_delays = tuple(cooldown_delays) or (refresh_seconds,)
+        self.base_refresh_seconds = refresh_seconds
+        self.max_refresh_seconds = max_refresh_seconds or refresh_seconds
+        self.relax_after_successes = max(1, relax_after_successes)
         self.refresh_seconds = refresh_seconds
         self.reconnect_delays = tuple(reconnect_delays) or (1.0,)
         self.stop_event = threading.Event()
@@ -1148,8 +1165,30 @@ class UsagePoller(threading.Thread):
             self.stop_event.wait(min(0.25, remaining))
         return True
 
+    def _parse_fallback(self, payload: Any) -> Optional[UsageSnapshot]:
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            snapshot = self.parse(payload)
+        except (TypeError, ValueError, KeyError):
+            return None
+        return snapshot if snapshot.available else None
+
+    def _note_rate_limit(self) -> None:
+        """Poll slower from now on, so the limit is not tripped again."""
+
+        self.refresh_seconds = min(self.refresh_seconds * 2, self.max_refresh_seconds)
+
+    def _note_success(self, streak: int) -> None:
+        """After a clean run, step back toward the fast base interval."""
+
+        if streak and streak % self.relax_after_successes == 0:
+            self.refresh_seconds = max(self.base_refresh_seconds, self.refresh_seconds / 2)
+
     def run(self) -> None:
         failure_count = 0
+        cooldown_count = 0
+        success_streak = 0
         try:
             while not self.stop_event.is_set():
                 try:
@@ -1168,7 +1207,40 @@ class UsagePoller(threading.Thread):
                             )
                         )
                     failure_count = 0
+                    cooldown_count = 0
+                    success_streak += 1
+                    self._note_success(success_streak)
                     if self._wait_or_disconnect(self.refresh_seconds):
+                        break
+                except self.cooldown_errors as exc:
+                    # The server is throttling us. Probe again soon in case it
+                    # was a short burst limit, then back off further each time:
+                    # hammering it every poll is what kept it from lifting.
+                    live = self._parse_fallback(getattr(exc, "payload", None))
+                    if live is not None:
+                        # The primary endpoint is blocked, but a fallback read
+                        # still produced current numbers: show them as live.
+                        self.output.put(
+                            UiMessage(
+                                "snapshot",
+                                snapshot=live,
+                                detail="rate limited; values from fallback",
+                                source=self.source,
+                            )
+                        )
+                    else:
+                        self.output.put(
+                            UiMessage("rate_limited", detail=str(exc), source=self.source)
+                        )
+                    if cooldown_count == 0:
+                        self._note_rate_limit()
+                    delay = self.cooldown_delays[
+                        min(cooldown_count, len(self.cooldown_delays) - 1)
+                    ]
+                    cooldown_count += 1
+                    failure_count = 0
+                    success_streak = 0
+                    if self.stop_event.wait(delay):
                         break
                 except self.rpc_errors as exc:
                     self.output.put(
@@ -1261,14 +1333,15 @@ class UsageRow:
             self.bar.itemconfigure(self.fill, fill=color)
             self._fill_color = color
 
-    def set_window(self, window: Optional[RateWindow]) -> None:
+    def set_window(self, window: Optional[RateWindow], *, stale: bool = False) -> None:
         if window is None:
             _configure_once(self.percent, self._percent_cache, text="—", fg=MUTED)
             _configure_once(self.reset, self._reset_cache, text="Reset —")
             self._set_fill(0, self._fill_color or GREEN)
             return
 
-        color = remaining_color(window)
+        # An old reading drawn in live colours reads as current; grey it out.
+        color = MUTED if stale else remaining_color(window)
         _configure_once(
             self.percent,
             self._percent_cache,
@@ -1299,6 +1372,7 @@ class CompactUsage:
         self.prefix = label
         self.width = width
         self._window: Optional[RateWindow] = None
+        self._stale = False
         self._label_cache: dict[str, Any] = {}
         self._reset_cache: dict[str, Any] = {}
 
@@ -1335,8 +1409,9 @@ class CompactUsage:
         self.prefix = prefix
         self._render()
 
-    def set_window(self, window: Optional[RateWindow]) -> None:
+    def set_window(self, window: Optional[RateWindow], *, stale: bool = False) -> None:
         self._window = window
+        self._stale = stale
         self._render()
 
     def _render(self) -> None:
@@ -1355,7 +1430,7 @@ class CompactUsage:
             self.label,
             self._label_cache,
             text=f"{self.prefix} {format_percent(window.remaining_percent)}",
-            fg=remaining_color(window),
+            fg=MUTED if self._stale else remaining_color(window),
         )
         _configure_once(
             self.reset,
@@ -1806,6 +1881,9 @@ class CodexUsageWidget:
             unavailable_detail="Claude 구독 한도를 찾지 못했습니다.",
             rpc_errors=(ClaudeUnavailableError,),
             connection_errors=(ClaudeConnectionError, ClaudeUsageError, OSError),
+            cooldown_errors=(ClaudeRateLimitedError,),
+            cooldown_delays=CLAUDE_RATE_LIMIT_BACKOFF_SECONDS,
+            max_refresh_seconds=CLAUDE_MAX_REFRESH_SECONDS,
             refresh_seconds=CLAUDE_REFRESH_SECONDS,
         )
         self._closed = False
@@ -1817,6 +1895,8 @@ class CodexUsageWidget:
         self._save_after_id: Optional[str] = None
         self._flash_after_id: Optional[str] = None
         self._notify_after_id: Optional[str] = None
+        self._stale_after_id: Optional[str] = None
+        self._last_live: dict[str, float] = {}
         self._hwnd: Optional[int] = None
         self._raise_failures = 0
         self._last_raise_log = 0.0
@@ -2023,6 +2103,7 @@ class CodexUsageWidget:
         self._refresh_topmost()
         self._after_id = root.after(100, self._drain_messages)
         self._display_after_id = root.after(DISPLAY_WATCH_MS, self._watch_display)
+        self._stale_after_id = root.after(STALE_CHECK_MS, self._refresh_staleness)
         if autostart:
             self.poller.start()
             self.claude_poller.start()
@@ -2186,13 +2267,22 @@ class CodexUsageWidget:
             return
         try:
             signature = self._current_display_signature()
-            if signature and signature != self._display_signature:
+            width, height = compact_size() if self._compact_mode else detail_size()
+            actual = (self.root.winfo_x(), self.root.winfo_y())
+            fitted = _restore_visible_position(self.root, actual, width, height)
+            misplaced = fitted != actual
+            if signature and (signature != self._display_signature or misplaced):
                 LOG.info(
                     "display layout changed: %s -> %s",
                     self._display_signature,
                     signature,
                 )
                 self._display_signature = signature
+                if misplaced:
+                    self._position = fitted or (
+                        _compact_initial_position(self.root)
+                        if self._compact_mode else _initial_position(self.root)
+                    )
                 if self._compact_mode:
                     self.show_compact()
                 else:
@@ -2221,7 +2311,12 @@ class CodexUsageWidget:
         width, height = compact_size() if self._compact_mode else detail_size()
         current = self._position
         fitted = _restore_visible_position(self.root, current, width, height)
-        if fitted is not None and fitted != current:
+        if fitted is None:
+            fitted = (
+                _compact_initial_position(self.root)
+                if self._compact_mode else _initial_position(self.root)
+            )
+        if fitted != current:
             self.root.geometry(f"{fitted[0]:+d}{fitted[1]:+d}")
             self._position = fitted
         self._save_window_state()
@@ -2276,13 +2371,13 @@ class CodexUsageWidget:
         if message.kind == "snapshot" and message.snapshot is not None:
             self._snapshots[source] = message.snapshot
             self._source_status[source] = "live"
+            self._last_live[source] = time.monotonic()
             self._render_source(source)
             self._schedule_snapshot_save()
             self._check_alerts(source, message.snapshot)
         else:
             self._source_status[source] = message.kind
-            if source not in self._snapshots:
-                self._render_source(source)
+            self._render_source(source)
 
         if self._source_status[source] != previous_status:
             level = logging.INFO if message.kind == "snapshot" else logging.WARNING
@@ -2411,16 +2506,45 @@ class CodexUsageWidget:
         for source in SOURCES:
             self._render_source(source)
 
+    def _is_stale(self, source: str) -> bool:
+        """True when the value on screen is an old reading, not a live one."""
+
+        if source not in self._snapshots:
+            return False
+        if self._source_status.get(source) in ("live", "cached", "pending"):
+            return False
+        last_live = self._last_live.get(source)
+        if last_live is None:
+            # Nothing has succeeded since start-up: the value is from the cache,
+            # possibly days old.
+            return True
+        return time.monotonic() - last_live > STALE_AFTER_SECONDS.get(source, 300.0)
+
+    def _refresh_staleness(self) -> None:
+        """Staleness grows with time alone, so re-check it on a timer."""
+
+        if self._closed:
+            return
+        try:
+            self._render_all()
+        finally:
+            if not self._closed:
+                self._stale_after_id = self.root.after(
+                    STALE_CHECK_MS,
+                    self._refresh_staleness,
+                )
+
     def _render_source(self, source: str) -> None:
         snapshot = self._snapshots.get(source)
+        stale = self._is_stale(source)
         if source == SOURCE_CODEX:
             labels = default_snapshot_labels(SOURCE_CODEX)
             weekly_label = snapshot.weekly_label if snapshot else labels[1]
             self.weekly_row.set_title(weekly_label)
             self.compact_weekly.set_prefix(weekly_label)
             weekly = snapshot.weekly if snapshot else None
-            self.weekly_row.set_window(weekly)
-            self.compact_weekly.set_window(weekly)
+            self.weekly_row.set_window(weekly, stale=stale)
+            self.compact_weekly.set_window(weekly, stale=stale)
             return
 
         labels = default_snapshot_labels(SOURCE_CLAUDE)
@@ -2433,10 +2557,10 @@ class CodexUsageWidget:
         self.claude_weekly_row.set_title(weekly_label)
         self.compact_claude_five_hour.set_prefix(five_hour_label)
         self.compact_claude_weekly.set_prefix(weekly_label)
-        self.claude_five_hour_row.set_window(five_hour)
-        self.claude_weekly_row.set_window(weekly)
-        self.compact_claude_five_hour.set_window(five_hour)
-        self.compact_claude_weekly.set_window(weekly)
+        self.claude_five_hour_row.set_window(five_hour, stale=stale)
+        self.claude_weekly_row.set_window(weekly, stale=stale)
+        self.compact_claude_five_hour.set_window(five_hour, stale=stale)
+        self.compact_claude_weekly.set_window(weekly, stale=stale)
 
     def _source_indicator(self, source: str) -> tuple[str, str, int]:
         """Return ``(text, colour, severity)`` for one source."""
@@ -2449,6 +2573,8 @@ class CodexUsageWidget:
             return "CACHED", AMBER, 1
         if kind == "pending":
             return "CONNECTING", AMBER, 1
+        if kind == "rate_limited":
+            return "WAIT", AMBER, 1
         if kind == "reconnecting":
             return ("OFFLINE" if has_data else "RECONNECTING", AMBER, 1 if has_data else 2)
         if kind == "unavailable":
@@ -2490,6 +2616,7 @@ class CodexUsageWidget:
             self._save_after_id,
             self._flash_after_id,
             self._notify_after_id,
+            self._stale_after_id,
         ):
             if after_id is not None:
                 try:
