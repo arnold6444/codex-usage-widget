@@ -12,7 +12,13 @@ from pathlib import Path
 from unittest import mock
 
 from claude_usage_client import (
+    CLAUDE_MAX_REFRESH_SECONDS,
+    CLAUDE_RATE_LIMIT_BACKOFF_SECONDS,
+    CLAUDE_REFRESH_SECONDS,
     ClaudeConnectionError,
+    ClaudeRateLimitedError,
+    ClaudeUnavailableError,
+    ClaudeUsageClient,
     parse_iso_timestamp,
     parse_limit_window,
 )
@@ -22,7 +28,9 @@ from codex_usage_widget import (
     COMPACT_HEIGHT,
     COMPACT_RESET_TEXT,
     COMPACT_WIDTH,
+    GREEN,
     LOG,
+    MUTED,
     RED,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
@@ -1034,6 +1042,29 @@ class TopmostHandleTests(unittest.TestCase):
 
 
 class WidgetSmokeTests(unittest.TestCase):
+    def test_offscreen_window_recovers_without_display_change(self):
+        root = tk.Tk()
+        widget = CodexUsageWidget(
+            root, client=_FlakyClient(), claude_client=_StubClaudeClient(),
+            autostart=False, persist_state=False,
+        )
+        try:
+            root.update()
+            widget._set_window_geometry(308, 32, 185, 9000000)
+            root.update()
+            widget._display_signature = widget._current_display_signature()
+            widget._watch_display()
+            root.update()
+            self.assertGreaterEqual(root.winfo_y(), 0)
+            self.assertLess(root.winfo_y() + root.winfo_height(), root.winfo_screenheight() + 1)
+            widget._position = (185, 9000000)
+            widget._finish_drag()
+            root.update()
+            self.assertLess(root.winfo_y() + root.winfo_height(), root.winfo_screenheight() + 1)
+        finally:
+            widget.close()
+            widget.shutdown()
+
     @unittest.skipUnless(sys.platform == "win32", "Windows HUD smoke test")
     def test_window_has_requested_hud_attributes(self):
         client = _FlakyClient()
@@ -1313,6 +1344,334 @@ class WidgetSmokeTests(unittest.TestCase):
                 root.update_idletasks()
                 self.assertLess(root.winfo_x(), root.winfo_screenwidth())
                 self.assertLess(root.winfo_y(), root.winfo_screenheight())
+            finally:
+                widget.close()
+                widget.shutdown()
+
+
+class ClaudeRateLimitTests(unittest.TestCase):
+    """The usage endpoint answered 429 with retry-after 3600 in the field."""
+
+    def _client_returning(self, payload, probe=None):
+        client = ClaudeUsageClient(command=("unused",), header_probe=probe is not None)
+        client._run_get_usage = lambda warm=False: (probe if warm else payload)
+        return client
+
+    def test_a_limited_endpoint_falls_back_to_live_header_values(self):
+        live = {
+            "rate_limits_available": True,
+            "rate_limits": {
+                "five_hour": {"utilization": 19, "resets_at": "2026-10-13T06:10:00.000Z"},
+                "seven_day": {"utilization": 20, "resets_at": "2026-10-18T13:00:00.000Z"},
+            },
+        }
+        client = self._client_returning(
+            {"rate_limits_available": True, "rate_limits": None}, probe=live
+        )
+        with self.assertRaises(ClaudeRateLimitedError) as caught:
+            client.read_rate_limits()
+
+        snapshot = select_claude_windows(caught.exception.payload)
+        self.assertEqual(snapshot.five_hour.used_percent, 19)
+        self.assertEqual(snapshot.weekly.used_percent, 20)
+
+    def test_a_failed_probe_leaves_no_payload(self):
+        client = self._client_returning(
+            {"rate_limits_available": True, "rate_limits": None},
+            probe={"rate_limits_available": True, "rate_limits": None},
+        )
+        with self.assertRaises(ClaudeRateLimitedError) as caught:
+            client.read_rate_limits()
+        self.assertIsNone(caught.exception.payload)
+
+    def test_the_probe_is_a_minimal_turn(self):
+        """It spends quota, so it must stay tiny and leave no session behind."""
+
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = list(command)
+            raise OSError("stop here")
+
+        client = ClaudeUsageClient(command=("claude.exe",))
+        with mock.patch("claude_usage_client.subprocess.Popen", side_effect=fake_popen):
+            with self.assertRaises(ClaudeConnectionError):
+                client._run_get_usage(warm=True)
+
+        command = captured["command"]
+        for flag in ("--no-session-persistence", "--strict-mcp-config", "--system-prompt"):
+            self.assertIn(flag, command)
+        self.assertEqual(command[command.index("--model") + 1], "haiku")
+        self.assertEqual(command[command.index("--tools") + 1], "")
+        self.assertEqual(command[command.index("--setting-sources") + 1], "local")
+
+    def test_empty_rate_limits_from_a_subscriber_means_rate_limited(self):
+        client = self._client_returning(
+            {"subscription_type": "team", "rate_limits_available": True, "rate_limits": None}
+        )
+        with self.assertRaises(ClaudeRateLimitedError):
+            client.read_rate_limits()
+
+    def test_an_account_without_limits_is_still_reported_as_unavailable(self):
+        client = self._client_returning({"rate_limits_available": False})
+        with self.assertRaises(ClaudeUnavailableError):
+            client.read_rate_limits()
+
+    def test_polls_skip_the_users_own_hooks(self):
+        """Every poll used to fire the user's SessionStart hooks (~960/day)."""
+
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = list(command)
+            raise OSError("stop here")
+
+        client = ClaudeUsageClient(command=("claude.exe",))
+        with mock.patch("claude_usage_client.subprocess.Popen", side_effect=fake_popen):
+            with self.assertRaises(ClaudeConnectionError):
+                client.read_rate_limits()
+
+        command = captured["command"]
+        self.assertIn("--setting-sources", command)
+        self.assertEqual(command[command.index("--setting-sources") + 1], "local")
+
+    def test_polling_is_fast_but_bounded(self):
+        # Fresh numbers matter, but never back to the 90 s that tripped it.
+        self.assertLessEqual(CLAUDE_REFRESH_SECONDS, 180)
+        self.assertGreater(CLAUDE_REFRESH_SECONDS, 90)
+        self.assertGreater(CLAUDE_MAX_REFRESH_SECONDS, CLAUDE_REFRESH_SECONDS)
+        # The first retry while limited comes well before an hour...
+        self.assertLessEqual(CLAUDE_RATE_LIMIT_BACKOFF_SECONDS[0], 600)
+        # ...and the schedule only ever gets slower.
+        self.assertEqual(
+            list(CLAUDE_RATE_LIMIT_BACKOFF_SECONDS),
+            sorted(CLAUDE_RATE_LIMIT_BACKOFF_SECONDS),
+        )
+
+    def test_poller_backs_off_instead_of_retrying_into_the_limit(self):
+        class _Limited:
+            is_disconnected = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def read_rate_limits(self):
+                self.calls += 1
+                raise ClaudeRateLimitedError("limited")
+
+            def shutdown(self):
+                pass
+
+        client = _Limited()
+        messages = queue.Queue()
+        poller = UsagePoller(
+            client,
+            messages,
+            source="claude",
+            parse=select_claude_windows,
+            rpc_errors=(ClaudeUnavailableError,),
+            connection_errors=(ClaudeConnectionError, OSError),
+            cooldown_errors=(ClaudeRateLimitedError,),
+            cooldown_delays=(60,),
+            refresh_seconds=0.01,
+            reconnect_delays=(0.01,),
+        )
+        poller.start()
+        try:
+            message = messages.get(timeout=2)
+            self.assertEqual(message.kind, "rate_limited")
+            self.assertEqual(message.source, "claude")
+            time.sleep(0.3)
+            # A 10 ms refresh would have retried dozens of times by now.
+            self.assertEqual(client.calls, 1)
+        finally:
+            poller.stop()
+            poller.join(timeout=2)
+
+    def _poller(self, client, **kwargs):
+        options = dict(
+            source="claude",
+            parse=select_claude_windows,
+            rpc_errors=(ClaudeUnavailableError,),
+            connection_errors=(ClaudeConnectionError, OSError),
+            cooldown_errors=(ClaudeRateLimitedError,),
+            refresh_seconds=120,
+            max_refresh_seconds=600,
+            relax_after_successes=3,
+        )
+        options.update(kwargs)
+        return UsagePoller(client, queue.Queue(), **options)
+
+    def test_a_rate_limit_slows_the_normal_interval_and_a_clean_run_restores_it(self):
+        poller = self._poller(_StubClaudeClient())
+
+        poller._note_rate_limit()
+        self.assertEqual(poller.refresh_seconds, 240)
+        poller._note_rate_limit()
+        poller._note_rate_limit()
+        poller._note_rate_limit()
+        self.assertEqual(poller.refresh_seconds, 600)  # capped
+
+        for streak in range(1, 7):
+            poller._note_success(streak)
+        self.assertEqual(poller.refresh_seconds, 150)  # halved twice
+        for streak in range(7, 30):
+            poller._note_success(streak)
+        self.assertEqual(poller.refresh_seconds, 120)  # never below the base
+
+    def test_fallback_values_are_shown_live_while_limited(self):
+        live = {
+            "rate_limits": {
+                "five_hour": {"utilization": 19, "resets_at": None},
+                "seven_day": {"utilization": 20, "resets_at": None},
+            }
+        }
+
+        class _LimitedWithFallback:
+            is_disconnected = False
+
+            def read_rate_limits(self):
+                raise ClaudeRateLimitedError("limited", payload=live)
+
+            def shutdown(self):
+                pass
+
+        messages = queue.Queue()
+        poller = UsagePoller(
+            _LimitedWithFallback(),
+            messages,
+            source="claude",
+            parse=select_claude_windows,
+            rpc_errors=(ClaudeUnavailableError,),
+            connection_errors=(ClaudeConnectionError, OSError),
+            cooldown_errors=(ClaudeRateLimitedError,),
+            cooldown_delays=(60,),
+            refresh_seconds=120,
+        )
+        poller.start()
+        try:
+            message = messages.get(timeout=2)
+            self.assertEqual(message.kind, "snapshot")
+            self.assertEqual(message.snapshot.five_hour.remaining_percent, 81)
+        finally:
+            poller.stop()
+            poller.join(timeout=2)
+
+    def test_retries_while_limited_follow_the_backoff_schedule(self):
+        waits = []
+
+        class _AlwaysLimited:
+            is_disconnected = False
+
+            def read_rate_limits(self):
+                raise ClaudeRateLimitedError("limited")
+
+            def shutdown(self):
+                pass
+
+        poller = self._poller(_AlwaysLimited(), cooldown_delays=(5, 10, 20))
+
+        def fake_wait(seconds):
+            waits.append(seconds)
+            return len(waits) >= 4  # stop after four sleeps
+
+        poller.stop_event.wait = fake_wait
+        poller.run()
+
+        self.assertEqual(waits, [5, 10, 20, 20])
+        # Only the first limit of a streak slows the normal interval.
+        self.assertEqual(poller.refresh_seconds, 240)
+
+
+class StaleDisplayTests(unittest.TestCase):
+    def _widget(self):
+        root = tk.Tk()
+        root.withdraw()
+        return CodexUsageWidget(
+            root,
+            client=_FlakyClient(),
+            claude_client=_StubClaudeClient(),
+            autostart=False,
+            persist_state=False,
+        )
+
+    def _claude_snapshot(self):
+        return select_claude_windows(
+            {
+                "rate_limits": {
+                    "five_hour": {"utilization": 8, "resets_at": None},
+                    "seven_day": {"utilization": 3, "resets_at": None},
+                }
+            }
+        )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD test")
+    def test_a_long_failing_source_is_greyed_out(self):
+        widget = self._widget()
+        try:
+            widget._apply_message(
+                UiMessage("snapshot", snapshot=self._claude_snapshot(), source="claude")
+            )
+            self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), GREEN)
+
+            widget._last_live["claude"] -= 10_000
+            widget._apply_message(UiMessage("rate_limited", detail="x", source="claude"))
+
+            self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), MUTED)
+            self.assertEqual(widget.claude_weekly_row.percent.cget("fg"), MUTED)
+            # The number itself is kept; only its colour says "old".
+            self.assertEqual(
+                widget.compact_claude_five_hour.label.cget("text"), "CL 5h 92%"
+            )
+            # Codex is unaffected.
+            self.assertEqual(widget._is_stale("codex"), False)
+        finally:
+            widget.close()
+            widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD test")
+    def test_one_failed_poll_does_not_grey_a_fresh_value(self):
+        widget = self._widget()
+        try:
+            widget._apply_message(
+                UiMessage(
+                    "snapshot",
+                    snapshot=select_usage_windows(
+                        {"rateLimits": {"limitId": "codex", "primary": window(27, 10_080)}}
+                    ),
+                )
+            )
+            widget._apply_message(
+                UiMessage("snapshot", snapshot=self._claude_snapshot(), source="claude")
+            )
+            widget._apply_message(UiMessage("rate_limited", detail="x", source="claude"))
+
+            self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), GREEN)
+            self.assertEqual(widget.status_label.cget("text"), "WAIT")
+        finally:
+            widget.close()
+            widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD test")
+    def test_a_cached_value_that_never_refreshes_is_greyed_at_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = UsageSnapshotStore(Path(directory) / "last_snapshot.json")
+            self.assertTrue(store.save({"claude": self._claude_snapshot()}))
+            root = tk.Tk()
+            root.withdraw()
+            widget = CodexUsageWidget(
+                root,
+                client=_FlakyClient(),
+                claude_client=_StubClaudeClient(),
+                autostart=False,
+                persist_state=False,
+                snapshot_store=store,
+                persist_snapshot=True,
+            )
+            try:
+                self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), GREEN)
+                widget._apply_message(UiMessage("rate_limited", detail="x", source="claude"))
+                self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), MUTED)
             finally:
                 widget.close()
                 widget.shutdown()

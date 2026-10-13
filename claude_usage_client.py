@@ -22,7 +22,27 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
-CLAUDE_REFRESH_SECONDS = 90.0
+# The usage endpoint is rate limited per account. Polling every 90 seconds
+# with no back-off tripped it with ``429 rate_limit_error, retry-after: 3600``,
+# and polling on through the limit kept it from ever lifting.
+#
+# The user wants fresh numbers, so start fast and let the poller adapt: each
+# rate limit doubles the normal interval (up to the maximum), and a long clean
+# run steps it back toward the fast base again.
+CLAUDE_REFRESH_SECONDS = 120.0
+CLAUDE_MAX_REFRESH_SECONDS = 600.0
+# While the usage endpoint is limited, re-check this often. Each check also
+# runs the header probe below, so the numbers keep moving during the limit.
+CLAUDE_RATE_LIMIT_BACKOFF_SECONDS = (300.0,)
+
+# Fallback while the usage endpoint is limited: every inference response carries
+# the same 5-hour / weekly utilisation in its headers, and the CLI answers
+# ``get_usage`` from those once a turn has run. A one-word Haiku turn with a
+# replaced system prompt, no tools and no MCP costs ~600 input tokens (about
+# $0.0015 equivalent), so it is used only while the free endpoint is blocked.
+CLAUDE_PROBE_MODEL = "haiku"
+CLAUDE_PROBE_SYSTEM_PROMPT = "Reply with one word."
+CLAUDE_PROBE_MESSAGE = "ok"
 CLAUDE_TIMEOUT_SECONDS = 60.0
 
 
@@ -36,6 +56,23 @@ class ClaudeConnectionError(ClaudeUsageError):
 
 class ClaudeUnavailableError(ClaudeUsageError):
     """The CLI answered but this account exposes no subscription limits."""
+
+
+class ClaudeRateLimitedError(ClaudeUsageError):
+    """The usage endpoint is throttling this account; stop polling for a while.
+
+    ``get_usage`` does not surface the HTTP status. When the server rate limits
+    the usage fetch, the CLI logs an in-band error and answers with
+    ``rate_limits_available: true`` but ``rate_limits: null`` -- that pairing is
+    the only signal we get.
+
+    ``payload`` carries live numbers from the header probe when it succeeded,
+    so callers can keep showing current values while they back off.
+    """
+
+    def __init__(self, message: str, *, payload: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.payload = dict(payload) if payload is not None else None
 
 
 def resolve_claude_command() -> tuple[str, ...]:
@@ -131,9 +168,11 @@ class ClaudeUsageClient:
         command: Optional[Sequence[str]] = None,
         *,
         request_timeout: float = CLAUDE_TIMEOUT_SECONDS,
+        header_probe: bool = True,
     ) -> None:
         self._command = tuple(command) if command is not None else None
         self._request_timeout = request_timeout
+        self._header_probe = header_probe
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
 
@@ -161,11 +200,46 @@ class ClaudeUsageClient:
             )
         rate_limits = payload.get("rate_limits")
         if not isinstance(rate_limits, Mapping):
+            if payload.get("rate_limits_available") is True:
+                raise ClaudeRateLimitedError(
+                    "Claude 사용량 조회가 일시 제한되었습니다(rate_limits 비어 있음).",
+                    payload=self._probe_headers(),
+                )
             raise ClaudeUnavailableError("Claude 한도 응답에 rate_limits가 없습니다.")
         return dict(payload)
 
-    def _run_get_usage(self) -> dict[str, Any]:
+    def _probe_headers(self) -> Optional[dict[str, Any]]:
+        """Read live limits from a minimal turn's response headers, or ``None``."""
+
+        if not self._header_probe or self._shutdown.is_set():
+            return None
+        try:
+            with self._lock:
+                payload = self._run_get_usage(warm=True)
+        except ClaudeUsageError:
+            return None
+        if isinstance(payload.get("rate_limits"), Mapping):
+            return payload
+        return None
+
+    def _run_get_usage(self, *, warm: bool = False) -> dict[str, Any]:
         base_command = self._command or resolve_claude_command()
+        probe_flags = (
+            [
+                "--no-session-persistence",
+                "--model",
+                CLAUDE_PROBE_MODEL,
+                "--max-turns",
+                "1",
+                "--tools",
+                "",
+                "--system-prompt",
+                CLAUDE_PROBE_SYSTEM_PROMPT,
+                "--strict-mcp-config",
+            ]
+            if warm
+            else []
+        )
         command = [
             *base_command,
             "-p",
@@ -174,6 +248,11 @@ class ClaudeUsageClient:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Load only folder-local settings so the user's own SessionStart
+            # hooks do not fire on every poll. Auth is unaffected.
+            "--setting-sources",
+            "local",
+            *probe_flags,
         ]
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -203,6 +282,18 @@ class ClaudeUsageClient:
         failure: Optional[Exception] = None
         done = threading.Event()
 
+        def send(message: Mapping[str, Any]) -> None:
+            stdin = process.stdin
+            if stdin is None:
+                raise ClaudeConnectionError("claude stdin 파이프가 없습니다.")
+            try:
+                stdin.write(
+                    json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+                stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                raise ClaudeConnectionError(f"claude 전송 실패: {exc}") from exc
+
         def pump() -> None:
             nonlocal failure
             stdout = process.stdout
@@ -220,6 +311,11 @@ class ClaudeUsageClient:
                     except json.JSONDecodeError:
                         continue
                     if not isinstance(message, Mapping):
+                        continue
+                    if warm and message.get("type") == "result":
+                        # The probe turn finished, so its response headers are
+                        # in the CLI's limit store now; ask for them.
+                        send(request)
                         continue
                     if message.get("type") != "control_response":
                         continue
@@ -243,6 +339,8 @@ class ClaudeUsageClient:
                         )
                     done.set()
                     return
+            except ClaudeConnectionError as exc:
+                failure = exc
             except (OSError, ValueError) as exc:
                 failure = ClaudeConnectionError(f"claude stdout 읽기 실패: {exc}")
             finally:
@@ -251,16 +349,15 @@ class ClaudeUsageClient:
         reader = threading.Thread(target=pump, name="claude-usage-stdout", daemon=True)
         reader.start()
         try:
-            stdin = process.stdin
-            if stdin is None:
-                raise ClaudeConnectionError("claude stdin 파이프가 없습니다.")
-            try:
-                stdin.write(
-                    json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n"
+            if warm:
+                send(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": CLAUDE_PROBE_MESSAGE},
+                    }
                 )
-                stdin.flush()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                raise ClaudeConnectionError(f"claude 전송 실패: {exc}") from exc
+            else:
+                send(request)
 
             if not done.wait(self._request_timeout):
                 raise ClaudeConnectionError(
