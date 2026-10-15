@@ -1244,7 +1244,11 @@ class UsagePoller(threading.Thread):
                         break
                 except self.rpc_errors as exc:
                     self.output.put(
-                        UiMessage("error", detail=str(exc), source=self.source)
+                        UiMessage(
+                            getattr(exc, "ui_kind", "error"),
+                            detail=str(exc),
+                            source=self.source,
+                        )
                     )
                     failure_count = 0
                     if self.stop_event.wait(self.refresh_seconds):
@@ -2511,8 +2515,12 @@ class CodexUsageWidget:
 
         if source not in self._snapshots:
             return False
-        if self._source_status.get(source) in ("live", "cached", "pending"):
+        status = self._source_status.get(source)
+        if status in ("live", "cached", "pending"):
             return False
+        if status == "logged_out":
+            # No new reading can arrive until the user logs in again.
+            return True
         last_live = self._last_live.get(source)
         if last_live is None:
             # Nothing has succeeded since start-up: the value is from the cache,
@@ -2575,6 +2583,9 @@ class CodexUsageWidget:
             return "CONNECTING", AMBER, 1
         if kind == "rate_limited":
             return "WAIT", AMBER, 1
+        if kind == "logged_out":
+            # Needs the user to sign in again; nothing will fix itself.
+            return "LOGIN", RED, 3
         if kind == "reconnecting":
             return ("OFFLINE" if has_data else "RECONNECTING", AMBER, 1 if has_data else 2)
         if kind == "unavailable":

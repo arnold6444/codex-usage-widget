@@ -57,6 +57,21 @@ class ClaudeConnectionError(ClaudeUsageError):
 class ClaudeUnavailableError(ClaudeUsageError):
     """The CLI answered but this account exposes no subscription limits."""
 
+    #: Status the HUD shows for this failure.
+    ui_kind = "error"
+
+
+class ClaudeLoggedOutError(ClaudeUnavailableError):
+    """The standalone ``claude`` CLI has no usable login.
+
+    The CLI clears its stored tokens on disk when a refresh comes back
+    ``invalid_grant`` (for example once the refresh token itself has expired),
+    after which ``get_usage`` answers with no subscription at all. Only the user
+    can sign in again; the widget keeps polling and recovers by itself after.
+    """
+
+    ui_kind = "logged_out"
+
 
 class ClaudeRateLimitedError(ClaudeUsageError):
     """The usage endpoint is throttling this account; stop polling for a while.
@@ -195,6 +210,11 @@ class ClaudeUsageClient:
             payload = self._run_get_usage()
 
         if payload.get("rate_limits_available") is False:
+            if not payload.get("subscription_type"):
+                # A logged-in subscriber always reports its plan here.
+                raise ClaudeLoggedOutError(
+                    "claude CLI 로그인이 만료되었습니다. 터미널에서 `claude auth login`을 실행하세요."
+                )
             raise ClaudeUnavailableError(
                 "이 계정에서는 Claude 구독 한도를 조회할 수 없습니다."
             )

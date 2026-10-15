@@ -243,3 +243,11 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Passed: live account, endpoint still limited -> fallback returned 5h 19% / weekly 20% used in 13.5 s; deployed widget logged `claude status cached -> live: rate limited; values from fallback` and the screenshot shows CL 5h 80% / CL 주 80% remaining in live colours.
 - Passed: `python -m unittest discover` -> 67 tests.
 - Not yet observed: the free endpoint lifting its limit (the widget switches back to it automatically).
+
+## Requirement Delta (2026-10-15, Claude CLI logged out)
+
+- Symptom: Claude columns stopped again; `widget.log` showed `claude status live -> error: 이 계정에서는 Claude 구독 한도를 조회할 수 없습니다.` from 10:39.
+- Cause (verified): `claude auth status` reported `loggedIn: false`. `.credentials.json` was rewritten at 10:37 with empty `accessToken`, `refreshToken` and `expiresAt`, while `refreshTokenExpiresAt` was 03:47 the same day. The CLI clears stored tokens on disk when a refresh returns `invalid_grant` (`tengu_oauth_refresh_token_marked_dead_invalid_grant`), so the login simply expired. `get_usage` then answers `subscription_type: null, rate_limits_available: false`, which the widget had reported as a generic error.
+- Fix: that signature raises `ClaudeLoggedOutError` (a `ClaudeUnavailableError` with `ui_kind = "logged_out"`). The poller reports the exception's `ui_kind`; the HUD shows `LOGIN` with a red dot and greys the Claude columns at once. Polling continues, so a new `claude auth login` is picked up within one interval with no restart.
+- Not fixable in the widget: signing in again is the user's action.
+- Passed: 70 tests; live account (logged out) -> `logged_out` detected; deployed HUD shows red dot and grey Claude columns.

@@ -16,6 +16,7 @@ from claude_usage_client import (
     CLAUDE_RATE_LIMIT_BACKOFF_SECONDS,
     CLAUDE_REFRESH_SECONDS,
     ClaudeConnectionError,
+    ClaudeLoggedOutError,
     ClaudeRateLimitedError,
     ClaudeUnavailableError,
     ClaudeUsageClient,
@@ -1413,9 +1414,58 @@ class ClaudeRateLimitTests(unittest.TestCase):
             client.read_rate_limits()
 
     def test_an_account_without_limits_is_still_reported_as_unavailable(self):
-        client = self._client_returning({"rate_limits_available": False})
-        with self.assertRaises(ClaudeUnavailableError):
+        client = self._client_returning(
+            {"subscription_type": "api", "rate_limits_available": False}
+        )
+        with self.assertRaises(ClaudeUnavailableError) as caught:
             client.read_rate_limits()
+        self.assertNotIsInstance(caught.exception, ClaudeLoggedOutError)
+
+    def test_a_cleared_cli_login_is_reported_as_logged_out(self):
+        """Seen in the field: the refresh token expired and the CLI wiped it."""
+
+        client = self._client_returning(
+            {"subscription_type": None, "rate_limits_available": False, "rate_limits": None}
+        )
+        with self.assertRaises(ClaudeLoggedOutError) as caught:
+            client.read_rate_limits()
+        self.assertIn("claude auth login", str(caught.exception))
+
+    def test_the_poller_reports_logout_and_keeps_polling(self):
+        class _LoggedOut:
+            is_disconnected = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def read_rate_limits(self):
+                self.calls += 1
+                raise ClaudeLoggedOutError("logged out")
+
+            def shutdown(self):
+                pass
+
+        client = _LoggedOut()
+        messages = queue.Queue()
+        poller = UsagePoller(
+            client,
+            messages,
+            source="claude",
+            parse=select_claude_windows,
+            rpc_errors=(ClaudeUnavailableError,),
+            connection_errors=(ClaudeConnectionError, OSError),
+            refresh_seconds=0.05,
+        )
+        poller.start()
+        try:
+            message = messages.get(timeout=2)
+            self.assertEqual(message.kind, "logged_out")
+            time.sleep(0.3)
+            # It keeps checking, so a fresh login is picked up on its own.
+            self.assertGreater(client.calls, 1)
+        finally:
+            poller.stop()
+            poller.join(timeout=2)
 
     def test_polls_skip_the_users_own_hooks(self):
         """Every poll used to fire the user's SessionStart hooks (~960/day)."""
@@ -1625,6 +1675,28 @@ class StaleDisplayTests(unittest.TestCase):
             )
             # Codex is unaffected.
             self.assertEqual(widget._is_stale("codex"), False)
+        finally:
+            widget.close()
+            widget.shutdown()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows HUD test")
+    def test_logout_shows_login_and_greys_at_once_then_recovers(self):
+        widget = self._widget()
+        try:
+            widget._apply_message(
+                UiMessage("snapshot", snapshot=self._claude_snapshot(), source="claude")
+            )
+            widget._apply_message(UiMessage("logged_out", detail="x", source="claude"))
+
+            self.assertEqual(widget.status_label.cget("text"), "LOGIN")
+            self.assertEqual(widget.compact_status.cget("fg"), RED)
+            self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), MUTED)
+
+            widget._apply_message(
+                UiMessage("snapshot", snapshot=self._claude_snapshot(), source="claude")
+            )
+            self.assertEqual(widget.compact_claude_five_hour.label.cget("fg"), GREEN)
+            self.assertNotEqual(widget.status_label.cget("text"), "LOGIN")
         finally:
             widget.close()
             widget.shutdown()
