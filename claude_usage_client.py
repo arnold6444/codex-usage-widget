@@ -19,7 +19,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from claude_token_store import read_token
 
 
 # The usage endpoint is rate limited per account. Polling every 90 seconds
@@ -73,7 +75,20 @@ class ClaudeLoggedOutError(ClaudeUnavailableError):
     ui_kind = "logged_out"
 
 
-class ClaudeRateLimitedError(ClaudeUsageError):
+class ClaudeFallbackError(ClaudeUsageError):
+    """The free usage path is down; ``payload`` may hold live numbers anyway.
+
+    Callers should show ``payload`` when present and retry the free path
+    later rather than on every poll, because the fallback spends a little
+    quota each time.
+    """
+
+    def __init__(self, message: str, *, payload: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.payload = dict(payload) if payload is not None else None
+
+
+class ClaudeRateLimitedError(ClaudeFallbackError):
     """The usage endpoint is throttling this account; stop polling for a while.
 
     ``get_usage`` does not surface the HTTP status. When the server rate limits
@@ -85,9 +100,9 @@ class ClaudeRateLimitedError(ClaudeUsageError):
     so callers can keep showing current values while they back off.
     """
 
-    def __init__(self, message: str, *, payload: Optional[Mapping[str, Any]] = None) -> None:
-        super().__init__(message)
-        self.payload = dict(payload) if payload is not None else None
+
+class ClaudeTokenFallbackError(ClaudeFallbackError):
+    """The CLI login has expired; numbers came from the stored long-lived token."""
 
 
 def resolve_claude_command() -> tuple[str, ...]:
@@ -167,7 +182,39 @@ def parse_limit_window(raw: Any) -> Optional[tuple[float, Optional[float]]]:
     if used_percent is None:
         return None
     used_percent = max(0.0, min(100.0, used_percent))
-    return used_percent, parse_iso_timestamp(raw.get("resets_at"))
+    resets_at = raw.get("resets_at")
+    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
+        return used_percent, float(resets_at)
+    return used_percent, parse_iso_timestamp(resets_at)
+
+
+def rate_limits_from_event(info: Any) -> Optional[dict[str, Any]]:
+    """Turn a stream-json ``rate_limit_event`` into ``get_usage``-style limits.
+
+    ``rate_limit_info.unifiedWindows`` is built straight from the response
+    headers, with ``utilization`` as a 0-1 fraction and ``resetsAt`` in epoch
+    seconds. Unlike ``get_usage`` it is not gated on the profile scope, so it
+    also works with a long-lived inference-only token.
+    """
+
+    if not isinstance(info, Mapping):
+        return None
+    windows = info.get("unifiedWindows")
+    if not isinstance(windows, Mapping):
+        return None
+    limits: dict[str, Any] = {}
+    for key in ("five_hour", "seven_day"):
+        window = windows.get(key)
+        if not isinstance(window, Mapping):
+            continue
+        fraction = _number(window.get("utilization"))
+        if fraction is None:
+            continue
+        limits[key] = {
+            "utilization": fraction * 100.0,
+            "resets_at": _number(window.get("resetsAt")),
+        }
+    return limits or None
 
 
 class ClaudeUsageClient:
@@ -184,10 +231,12 @@ class ClaudeUsageClient:
         *,
         request_timeout: float = CLAUDE_TIMEOUT_SECONDS,
         header_probe: bool = True,
+        token_provider: Optional[Callable[[], Optional[str]]] = read_token,
     ) -> None:
         self._command = tuple(command) if command is not None else None
         self._request_timeout = request_timeout
         self._header_probe = header_probe
+        self._token_provider = token_provider
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
 
@@ -212,8 +261,16 @@ class ClaudeUsageClient:
         if payload.get("rate_limits_available") is False:
             if not payload.get("subscription_type"):
                 # A logged-in subscriber always reports its plan here.
+                live = self._probe_with_token()
+                if live is not None:
+                    raise ClaudeTokenFallbackError(
+                        "claude CLI 로그인이 만료되어 장기 토큰으로 조회했습니다.",
+                        payload=live,
+                    )
                 raise ClaudeLoggedOutError(
-                    "claude CLI 로그인이 만료되었습니다. 터미널에서 `claude auth login`을 실행하세요."
+                    "claude CLI 로그인이 만료되었습니다. `python setup_claude_token.py`로 "
+                    "장기 토큰을 한 번 등록하면 자동으로 계속 조회합니다 "
+                    "(또는 `claude auth login`)."
                 )
             raise ClaudeUnavailableError(
                 "이 계정에서는 Claude 구독 한도를 조회할 수 없습니다."
@@ -227,6 +284,28 @@ class ClaudeUsageClient:
                 )
             raise ClaudeUnavailableError("Claude 한도 응답에 rate_limits가 없습니다.")
         return dict(payload)
+
+    def _probe_with_token(self) -> Optional[dict[str, Any]]:
+        """Read live limits using the stored ``claude setup-token`` token."""
+
+        if self._token_provider is None or self._shutdown.is_set():
+            return None
+        try:
+            token = self._token_provider()
+        except Exception:  # noqa: BLE001 - a broken store must not stop polling
+            return None
+        if not token:
+            return None
+        try:
+            with self._lock:
+                payload = self._run_get_usage(warm=True, oauth_token=token)
+        except ClaudeUsageError:
+            return None
+        finally:
+            token = None
+        if isinstance(payload.get("rate_limits"), Mapping):
+            return payload
+        return None
 
     def _probe_headers(self) -> Optional[dict[str, Any]]:
         """Read live limits from a minimal turn's response headers, or ``None``."""
@@ -242,7 +321,12 @@ class ClaudeUsageClient:
             return payload
         return None
 
-    def _run_get_usage(self, *, warm: bool = False) -> dict[str, Any]:
+    def _run_get_usage(
+        self,
+        *,
+        warm: bool = False,
+        oauth_token: Optional[str] = None,
+    ) -> dict[str, Any]:
         base_command = self._command or resolve_claude_command()
         probe_flags = (
             [
@@ -275,9 +359,16 @@ class ClaudeUsageClient:
             *probe_flags,
         ]
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        env = None
+        if oauth_token:
+            # Hand the token to the child only. With this set the CLI uses it
+            # instead of the (expired) stored login and never writes to disk.
+            env = dict(os.environ)
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         try:
             process = subprocess.Popen(
                 command,
+                env=env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -299,6 +390,7 @@ class ClaudeUsageClient:
         }
 
         result: dict[str, Any] = {}
+        event_limits: dict[str, Any] = {}
         failure: Optional[Exception] = None
         done = threading.Event()
 
@@ -332,6 +424,11 @@ class ClaudeUsageClient:
                         continue
                     if not isinstance(message, Mapping):
                         continue
+                    if message.get("type") == "rate_limit_event":
+                        limits = rate_limits_from_event(message.get("rate_limit_info"))
+                        if limits:
+                            event_limits.update(limits)
+                        continue
                     if warm and message.get("type") == "result":
                         # The probe turn finished, so its response headers are
                         # in the CLI's limit store now; ask for them.
@@ -353,6 +450,10 @@ class ClaudeUsageClient:
                     inner = response.get("response")
                     if isinstance(inner, Mapping):
                         result.update(inner)
+                        if not isinstance(result.get("rate_limits"), Mapping) and event_limits:
+                            # get_usage hides limits without the profile scope;
+                            # the headers that came with the turn still have them.
+                            result["rate_limits"] = dict(event_limits)
                     else:
                         failure = ClaudeConnectionError(
                             "claude get_usage 응답 형식이 올바르지 않습니다."

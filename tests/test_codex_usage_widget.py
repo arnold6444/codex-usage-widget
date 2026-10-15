@@ -16,13 +16,17 @@ from claude_usage_client import (
     CLAUDE_RATE_LIMIT_BACKOFF_SECONDS,
     CLAUDE_REFRESH_SECONDS,
     ClaudeConnectionError,
+    ClaudeFallbackError,
     ClaudeLoggedOutError,
     ClaudeRateLimitedError,
+    ClaudeTokenFallbackError,
     ClaudeUnavailableError,
     ClaudeUsageClient,
     parse_iso_timestamp,
     parse_limit_window,
 )
+from claude_token_store import delete_token, read_token, write_token
+from claude_usage_client import rate_limits_from_event
 from usage_alerts import AlertTracker, describe_alert
 from codex_usage_widget import (
     BORDER,
@@ -1354,7 +1358,9 @@ class ClaudeRateLimitTests(unittest.TestCase):
     """The usage endpoint answered 429 with retry-after 3600 in the field."""
 
     def _client_returning(self, payload, probe=None):
-        client = ClaudeUsageClient(command=("unused",), header_probe=probe is not None)
+        client = ClaudeUsageClient(
+            command=("unused",), header_probe=probe is not None, token_provider=None
+        )
         client._run_get_usage = lambda warm=False: (probe if warm else payload)
         return client
 
@@ -1747,6 +1753,109 @@ class StaleDisplayTests(unittest.TestCase):
             finally:
                 widget.close()
                 widget.shutdown()
+
+
+FAKE_CLAUDE = r"""
+import json, os, sys
+token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    if msg.get("type") == "user":
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed",
+            "unifiedWindows": {
+                "five_hour": {"utilization": 0.19, "resetsAt": 1792000000},
+                "seven_day": {"utilization": 0.2, "resetsAt": 1792500000}}},
+            "uuid": "u", "session_id": "s"}), flush=True)
+        print(json.dumps({"type": "result", "subtype": "success"}), flush=True)
+    elif msg.get("type") == "control_request":
+        print(json.dumps({"type": "control_response", "response": {
+            "subtype": "success", "request_id": msg["request_id"], "response": {
+                "subscription_type": None, "rate_limits_available": False,
+                "rate_limits": None, "token_seen": token.startswith("sk-ant-")}}}), flush=True)
+"""
+
+FAKE_TOKEN = "sk-ant-oat01-" + "x" * 60
+
+
+class ClaudeTokenFallbackTests(unittest.TestCase):
+    """A login that expires on its own must not need a manual re-login."""
+
+    def test_rate_limit_event_windows_become_percentages(self):
+        limits = rate_limits_from_event(
+            {"unifiedWindows": {
+                "five_hour": {"utilization": 0.19, "resetsAt": 1792000000},
+                "seven_day": {"utilization": 0.2, "resetsAt": 1792500000}}}
+        )
+        snapshot = select_claude_windows({"rate_limits": limits})
+        self.assertAlmostEqual(snapshot.five_hour.used_percent, 19.0)
+        self.assertAlmostEqual(snapshot.weekly.used_percent, 20.0)
+        self.assertEqual(snapshot.five_hour.resets_at, 1792000000.0)
+        self.assertIsNone(rate_limits_from_event({"status": "allowed"}))
+        self.assertIsNone(rate_limits_from_event(None))
+
+    def test_token_probe_reads_limits_from_the_turn_headers(self):
+        """get_usage hides limits for an inference-only token; the event does not."""
+
+        client = ClaudeUsageClient(
+            command=(sys.executable, "-u", "-c", FAKE_CLAUDE),
+            request_timeout=10,
+            token_provider=lambda: FAKE_TOKEN,
+        )
+        payload = client._probe_with_token()
+
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["token_seen"])  # reached the child via env
+        snapshot = select_claude_windows(payload)
+        self.assertAlmostEqual(snapshot.five_hour.used_percent, 19.0)
+        self.assertAlmostEqual(snapshot.weekly.used_percent, 20.0)
+
+    def test_expired_login_uses_the_token_and_reports_live_numbers(self):
+        live = {"rate_limits": {"five_hour": {"utilization": 19, "resets_at": None}}}
+        client = ClaudeUsageClient(command=("unused",), token_provider=lambda: FAKE_TOKEN)
+        client._run_get_usage = lambda warm=False, oauth_token=None: (
+            live if oauth_token else {"subscription_type": None, "rate_limits_available": False}
+        )
+        with self.assertRaises(ClaudeTokenFallbackError) as caught:
+            client.read_rate_limits()
+        self.assertIsInstance(caught.exception, ClaudeFallbackError)
+        self.assertEqual(caught.exception.payload, live)
+
+    def test_without_a_token_an_expired_login_still_says_login(self):
+        client = ClaudeUsageClient(command=("unused",), token_provider=lambda: None)
+        client._run_get_usage = lambda warm=False, oauth_token=None: {
+            "subscription_type": None, "rate_limits_available": False}
+        with self.assertRaises(ClaudeLoggedOutError) as caught:
+            client.read_rate_limits()
+        self.assertIn("setup_claude_token.py", str(caught.exception))
+
+    def test_the_token_is_never_put_on_the_command_line(self):
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = list(command)
+            captured["env"] = kwargs.get("env")
+            raise OSError("stop here")
+
+        client = ClaudeUsageClient(command=("claude.exe",))
+        with mock.patch("claude_usage_client.subprocess.Popen", side_effect=fake_popen):
+            with self.assertRaises(ClaudeConnectionError):
+                client._run_get_usage(warm=True, oauth_token=FAKE_TOKEN)
+
+        self.assertNotIn(FAKE_TOKEN, " ".join(captured["command"]))
+        self.assertEqual(captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"], FAKE_TOKEN)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Credential Manager")
+    def test_token_store_round_trip(self):
+        target = f"CodexUsageWidget/Test-{os.getpid()}"
+        try:
+            self.assertFalse(write_token("not a token", target))
+            self.assertTrue(write_token(FAKE_TOKEN, target))
+            self.assertEqual(read_token(target), FAKE_TOKEN)
+            self.assertTrue(delete_token(target))
+            self.assertIsNone(read_token(target))
+        finally:
+            delete_token(target)
 
 
 if __name__ == "__main__":
