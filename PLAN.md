@@ -261,3 +261,4 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Passed: 76 tests, including a fake CLI that emits `rate_limit_event` and checks the token arrived by environment; Credential Manager round trip under a throwaway target.
 - Passed: deployed; with no token stored the widget still reports `logged_out` with the new guidance.
 - Not yet observed: a real `claude setup-token` token end to end (needs the user's one-time browser approval).
+- Correction (2026-10-15): the account was the F4GE team account all along (already `subscriptionType: team` on 2026-09-16), so "it only started after leaving a personal account" was wrong. Verified facts only: CLI unchanged since 2026-09-15 (2.1.272); the login made on 2026-10-13 had a refresh token expiring 2026-10-15 03:47; earlier logins on the same account lasted weeks. Why this one was short is not known.
