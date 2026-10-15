@@ -144,8 +144,9 @@ Claude의 `get_usage` 컨트롤 요청은 CLI가 experimental로 표시한 경�
 1. PowerShell에서 `codex --version`, `claude --version`이 동작하는지 확인합니다.
 2. 두 CLI 로그인이 유지되어 있는지 각 공식 CLI에서 확인합니다.
 3. `codex app-server --help`가 오류 없이 끝나는지 확인합니다.
-4. Claude 열만 비어 있다면 Claude Code에서 `/usage`가 값을 보여주는지 확인합니다. API 키 계정 등 구독 한도가 없는 경우에는 정상적으로 `NO MATCH`가 됩니다.
-5. CLI 업데이트 후 위젯을 다시 실행합니다.
+4. 상태가 `LOGIN`(빨간 점, Claude 열 회색)이면 Claude CLI 로그인이 만료된 것입니다. 갱신 토큰이 만료되면 CLI가 저장된 토큰을 스스로 지웁니다. 터미널에서 `claude auth login`을 한 번 실행하면 위젯은 다음 조회(최대 2분) 때 저절로 복구됩니다. `claude auth status`의 `loggedIn`으로 확인할 수 있습니다.
+5. Claude 열만 비어 있다면 Claude Code에서 `/usage`가 값을 보여주는지 확인합니다. API 키 계정 등 구독 한도가 없는 경우에는 정상적으로 `NO MATCH`가 됩니다.
+6. CLI 업데이트 후 위젯을 다시 실행합니다.
 
 증상이 표시 쪽(안 보임, 위치 이상)이라면 `%LOCALAPPDATA%\CodexUsageWidget\widget.log`를 먼저 확인하세요. 가려짐 복구 횟수와 Win32 실패가 그대로 남습니다.
 
