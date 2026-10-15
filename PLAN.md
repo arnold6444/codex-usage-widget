@@ -251,3 +251,13 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Fix: that signature raises `ClaudeLoggedOutError` (a `ClaudeUnavailableError` with `ui_kind = "logged_out"`). The poller reports the exception's `ui_kind`; the HUD shows `LOGIN` with a red dot and greys the Claude columns at once. Polling continues, so a new `claude auth login` is picked up within one interval with no restart.
 - Not fixable in the widget: signing in again is the user's action.
 - Passed: 70 tests; live account (logged out) -> `logged_out` detected; deployed HUD shows red dot and grey Claude columns.
+
+## Requirement Delta (2026-10-15, survive login expiry without manual re-login)
+
+- User requirement: re-logging in every couple of days is not acceptable; it must keep working on its own.
+- Long-lived tokens from `claude setup-token` are inference-only by design (CLI text: "limited to inference-only for security reasons"), and `get_usage` returns `rate_limits: null` without the profile scope. The stream-json `rate_limit_event` is different: `rate_limit_info.unifiedWindows` is built from the response headers (`Ro(MU())`, utilization as a 0-1 fraction, `resetsAt` in epoch seconds) with no profile-scope gate.
+- Design: free `get_usage` stays primary. When it reports a logged-out CLI and a token is stored, run the one-word Haiku probe with `CLAUDE_CODE_OAUTH_TOKEN` set in the child's environment only, collect `rate_limit_event.unifiedWindows`, and fill `rate_limits` from it. This raises `ClaudeTokenFallbackError(payload=...)`; `ClaudeRateLimitedError` shares the new `ClaudeFallbackError` base, so the poller shows the payload live and re-checks the free path every 5 minutes.
+- Token storage: Windows Credential Manager generic credential `CodexUsageWidget/ClaudeOAuthToken` (`claude_token_store.py`). One-time setup: `python setup_claude_token.py` (runs `claude setup-token`, takes the token through `getpass`, stores it, then tests it). Never on a command line, never logged.
+- Passed: 76 tests, including a fake CLI that emits `rate_limit_event` and checks the token arrived by environment; Credential Manager round trip under a throwaway target.
+- Passed: deployed; with no token stored the widget still reports `logged_out` with the new guidance.
+- Not yet observed: a real `claude setup-token` token end to end (needs the user's one-time browser approval).

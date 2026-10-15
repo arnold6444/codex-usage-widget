@@ -54,6 +54,20 @@ claude --version
 
 소스 실행이나 재빌드가 필요할 때는 `python --version`도 확인합니다.
 
+## Claude 로그인 만료 대비 (한 번만)
+
+Claude CLI의 일반 로그인은 일정 기간이 지나면 저절로 만료될 수 있고(팀 계정에서 약 이틀), 만료되면 CLI가 저장된 로그인을 지웁니다. 매번 다시 로그인하지 않으려면 장기 토큰을 한 번 등록하세요.
+
+```powershell
+python setup_claude_token.py
+```
+
+`claude setup-token`이 실행되면 브라우저에서 승인하고, 화면에 나온 `sk-ant-...` 토큰을 붙여넣으면 됩니다(입력이 화면에 보이지 않음). 토큰은 Windows 자격 증명 관리자(`CodexUsageWidget/ClaudeOAuthToken`)에 저장되고, 위젯은 `claude` 하위 프로세스의 환경 변수로만 넘깁니다. 화면이나 로그에는 출력하지 않습니다.
+
+- 일반 로그인이 살아 있으면: 지금처럼 무료 사용량 API를 2분마다 씁니다.
+- 일반 로그인이 만료되면: 장기 토큰으로 5분마다 Haiku 한 단어 턴을 실행하고, 그 응답의 `rate_limit_event`(5시간·주간 사용률)를 읽습니다. 한 번에 약 $0.0015 상당입니다. 장기 토큰은 추론 전용이라 `get_usage`가 사용률을 숨기므로, 응답 이벤트에서 직접 읽습니다.
+- 확인: `python setup_claude_token.py --check`, 삭제: `--remove`.
+
 ## Windows 자동 실행
 
 현재 사용자 시작프로그램 바로가기:
