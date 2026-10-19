@@ -41,6 +41,7 @@ from codex_usage_widget import (
     WINDOW_WIDTH,
     CodexAppServerClient,
     CodexConnectionError,
+    CodexRpcError,
     CodexUsageWidget,
     RateWindow,
     UiMessage,
@@ -1856,6 +1857,93 @@ class ClaudeTokenFallbackTests(unittest.TestCase):
             self.assertIsNone(read_token(target))
         finally:
             delete_token(target)
+
+
+
+class StuckBackendTests(unittest.TestCase):
+    """An app-server that stays alive but keeps failing must be replaced.
+
+    In the field one answered ``-32603 error sending request`` every poll for
+    seven hours while a freshly started app-server worked straight away.
+    """
+
+    class _Flaky:
+        is_disconnected = False
+
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.resets = 0
+            self.calls = 0
+
+        def read_rate_limits(self):
+            self.calls += 1
+            answer = self.answers.pop(0) if self.answers else "ok"
+            if answer == "rpc":
+                raise CodexRpcError("app-server RPC 오류 -32603: error sending request")
+            if answer == "empty":
+                return {}
+            return {"rateLimits": {"limitId": "codex", "primary": window(27, 10_080)}}
+
+        def reset(self):
+            self.resets += 1
+
+        def shutdown(self):
+            pass
+
+    def _run(self, client, stop_after):
+        messages = queue.Queue()
+        poller = UsagePoller(client, messages, refresh_seconds=60, reset_after_failures=3)
+        waits = []
+
+        def fake_wait(seconds):
+            waits.append(seconds)
+            return len(waits) >= stop_after
+
+        poller.stop_event.wait = fake_wait
+        poller._wait_or_disconnect = lambda seconds: fake_wait(seconds)
+        poller.run()
+        kinds = []
+        while not messages.empty():
+            kinds.append(messages.get().kind)
+        return kinds
+
+    def test_repeated_rpc_errors_restart_the_backend_once(self):
+        client = self._Flaky(["rpc", "rpc", "rpc", "ok"])
+        kinds = self._run(client, stop_after=4)
+        self.assertEqual(client.resets, 1)
+        self.assertEqual(kinds, ["error", "error", "error", "snapshot"])
+
+    def test_answers_without_a_weekly_window_also_restart_it(self):
+        client = self._Flaky(["empty", "empty", "empty", "ok"])
+        kinds = self._run(client, stop_after=4)
+        self.assertEqual(client.resets, 1)
+        self.assertEqual(kinds[-1], "snapshot")
+
+    def test_a_good_answer_clears_the_streak(self):
+        client = self._Flaky(["rpc", "rpc", "ok", "rpc", "rpc", "ok"])
+        self._run(client, stop_after=6)
+        self.assertEqual(client.resets, 0)
+
+    def test_clients_without_reset_are_left_alone(self):
+        class _NoReset(self._Flaky):
+            reset = None
+
+        client = _NoReset(["rpc", "rpc", "rpc", "rpc"])
+        self._run(client, stop_after=4)  # must not raise
+
+    def test_reset_really_starts_a_new_app_server(self):
+        client = make_fake_app_server_client()
+        try:
+            client.read_rate_limits()
+            first = client._connection.process
+            client.reset()
+            self.assertIsNotNone(first.poll())  # old one is gone
+            client.read_rate_limits()
+            second = client._connection.process
+            self.assertIsNot(first, second)
+            self.assertIsNone(second.poll())
+        finally:
+            client.shutdown()
 
 
 if __name__ == "__main__":

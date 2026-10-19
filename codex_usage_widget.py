@@ -1105,6 +1105,21 @@ class CodexAppServerClient:
         if connection is not None:
             self._stop_connection(connection)
 
+    def reset(self) -> None:
+        """Drop the current app-server so the next request starts a fresh one.
+
+        An app-server can stay alive yet keep failing every request -- in the
+        field one answered ``-32603 error sending request`` for seven hours
+        while a newly started one worked at once. A live process is otherwise
+        reused forever, so the poller calls this after repeated failures.
+        """
+
+        with self._state_lock:
+            connection = self._connection
+            self._connection = None
+        if connection is not None:
+            self._stop_connection(connection)
+
 
 class UsagePoller(threading.Thread):
     """Poll one usage source on its own thread.
@@ -1131,6 +1146,7 @@ class UsagePoller(threading.Thread):
         cooldown_delays: Sequence[float] = (),
         max_refresh_seconds: Optional[float] = None,
         relax_after_successes: int = 30,
+        reset_after_failures: int = 3,
         refresh_seconds: float = REFRESH_SECONDS,
         reconnect_delays: Sequence[float] = RECONNECT_DELAYS_SECONDS,
     ) -> None:
@@ -1147,6 +1163,7 @@ class UsagePoller(threading.Thread):
         self.base_refresh_seconds = refresh_seconds
         self.max_refresh_seconds = max_refresh_seconds or refresh_seconds
         self.relax_after_successes = max(1, relax_after_successes)
+        self.reset_after_failures = max(1, reset_after_failures)
         self.refresh_seconds = refresh_seconds
         self.reconnect_delays = tuple(reconnect_delays) or (1.0,)
         self.stop_event = threading.Event()
@@ -1185,10 +1202,31 @@ class UsagePoller(threading.Thread):
         if streak and streak % self.relax_after_successes == 0:
             self.refresh_seconds = max(self.base_refresh_seconds, self.refresh_seconds / 2)
 
+    def _note_bad_answer(self, streak: int) -> int:
+        """Restart the client's backend after repeated bad answers.
+
+        Returns the new streak (reset to 0 once a restart was requested).
+        """
+
+        reset = getattr(self.client, "reset", None)
+        if streak < self.reset_after_failures or not callable(reset):
+            return streak
+        LOG.warning(
+            "%s: %d bad answers in a row; restarting its backend process",
+            self.source,
+            streak,
+        )
+        try:
+            reset()
+        except Exception as exc:  # noqa: BLE001 - never let this kill polling
+            LOG.warning("%s: backend restart failed: %s", self.source, exc)
+        return 0
+
     def run(self) -> None:
         failure_count = 0
         cooldown_count = 0
         success_streak = 0
+        bad_streak = 0
         try:
             while not self.stop_event.is_set():
                 try:
@@ -1198,6 +1236,7 @@ class UsagePoller(threading.Thread):
                         self.output.put(
                             UiMessage("snapshot", snapshot=snapshot, source=self.source)
                         )
+                        bad_streak = 0
                     else:
                         self.output.put(
                             UiMessage(
@@ -1206,6 +1245,7 @@ class UsagePoller(threading.Thread):
                                 source=self.source,
                             )
                         )
+                        bad_streak = self._note_bad_answer(bad_streak + 1)
                     failure_count = 0
                     cooldown_count = 0
                     success_streak += 1
@@ -1251,6 +1291,7 @@ class UsagePoller(threading.Thread):
                         )
                     )
                     failure_count = 0
+                    bad_streak = self._note_bad_answer(bad_streak + 1)
                     if self.stop_event.wait(self.refresh_seconds):
                         break
                 except self.connection_errors as exc:

@@ -262,3 +262,11 @@ Out of scope: reading credential files or tokens, changing Codex authentication/
 - Passed: deployed; with no token stored the widget still reports `logged_out` with the new guidance.
 - Not yet observed: a real `claude setup-token` token end to end (needs the user's one-time browser approval).
 - Correction (2026-10-15): the account was the F4GE team account all along (already `subscriptionType: team` on 2026-09-16), so "it only started after leaving a personal account" was wrong. Verified facts only: CLI unchanged since 2026-09-15 (2.1.272); the login made on 2026-10-13 had a refresh token expiring 2026-10-15 03:47; earlier logins on the same account lasted weeks. Why this one was short is not known.
+
+## Requirement Delta (2026-10-19, Codex stuck on a broken app-server)
+
+- Symptom: Codex column stopped; `widget.log` showed `codex status ... -> error: app-server RPC 오류 -32603: failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)` from 11:12 with no recovery for 7.5 hours. Earlier, 2026-10-18 18:14 to 2026-10-19 07:53, it sat on `unavailable` (no weekly window) until the connection happened to drop.
+- Cause (verified): the widget's app-server (pid 23324, started 11:12:22, `codex-cli 0.160.1`) stayed alive and failed every request, while a freshly started app-server answered at once with a normal weekly window (1% used). The client replaced an app-server only when its process exited or the stream broke, never on error answers.
+- Fix: `CodexAppServerClient.reset()` drops the current app-server. `UsagePoller` counts consecutive bad answers (RPC errors, or a parsed answer with no window) and calls the client's `reset()` after 3 (about 90 s at the 30 s interval). A good answer clears the count; clients without `reset` (the one-shot Claude client) are left alone.
+- Passed: 81 tests, including one that starts the fake app-server, resets it, and checks the old process is gone and a new one answers.
+- Passed: deployed and restarted; `codex status cached -> live`, HUD shows CX 주 99%.
